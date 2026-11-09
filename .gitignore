@@ -1,0 +1,8 @@
+dist
+node_modules
+.DS_Store
+yarn.lock
+.idea
+.claude
+CLAUDE.md
+*.patch

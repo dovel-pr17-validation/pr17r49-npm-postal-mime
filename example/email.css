@@ -1,0 +1,38 @@
+body,
+html,
+td,
+th {
+    font-family: Sans-serif;
+    font-size: 13px;
+    padding: 0;
+    margin: 0;
+}
+
+body {
+    padding: 10px;
+}
+
+div.postal-email-header {
+    margin: 10px 0;
+}
+
+div.postal-email-header-row {
+    display: flex;
+}
+
+div.postal-email-header-key::after {
+    content: '\003a';
+}
+
+div.postal-email-header-key {
+    color: #888;
+    margin-right: 1em;
+    font-weight: bold;
+}
+
+div.postal-email-header-value {
+}
+
+div.postal-email-header-subject {
+    font-weight: bold;
+}

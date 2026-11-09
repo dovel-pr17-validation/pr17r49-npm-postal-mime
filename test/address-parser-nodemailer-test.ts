@@ -1,0 +1,2148 @@
+// The address parser is derived from the one in Nodemailer and both have received the
+// same security fixes. This suite mirrors Nodemailer's addressparser tests so that the
+// two implementations keep agreeing on how an address header is read. Tests for what
+// only postal-mime does, such as decoding RFC 2047 encoded words, live in
+// address-parser-test.ts.
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { addressParser as addressparser } from '../src/postal-mime.js';
+
+describe('#addressparser', () => {
+    it('should handle single address correctly', () => {
+        let input = 'andris@tr.ee';
+        let expected = [
+            {
+                address: 'andris@tr.ee',
+                name: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle multiple addresses correctly', () => {
+        let input = 'andris@tr.ee, andris@example.com';
+        let expected = [
+            {
+                address: 'andris@tr.ee',
+                name: ''
+            },
+            {
+                address: 'andris@example.com',
+                name: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle unquoted name correctly', () => {
+        let input = 'andris <andris@tr.ee>';
+        let expected = [
+            {
+                name: 'andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle quoted name correctly', () => {
+        let input = '"reinman, andris" <andris@tr.ee>';
+        let expected = [
+            {
+                name: 'reinman, andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle quoted semicolons correctly', () => {
+        let input = '"reinman; andris" <andris@tr.ee>';
+        let expected = [
+            {
+                name: 'reinman; andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle unquoted name, unquoted address correctly', () => {
+        let input = 'andris andris@tr.ee';
+        let expected = [
+            {
+                name: 'andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should keep a colon inside an address literal', () => {
+        let input = 'user@[IPv6:2001:db8::1]';
+        let expected = [
+            {
+                name: '',
+                address: 'user@[IPv6:2001:db8::1]'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should not let an unclosed address literal swallow later recipients', () => {
+        // A stray "[" must not absorb the following comma delimiters and drop the
+        // recipients after it - list separators always end the address.
+        let input = 'alice@example.com, bob[@example.com, carol@example.com';
+        let expected = [
+            { name: '', address: 'alice@example.com' },
+            { name: '', address: 'bob[@example.com' },
+            { name: '', address: 'carol@example.com' }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should split on a comma following an unclosed address literal', () => {
+        let input = 'a@[b, c@d';
+        let expected = [
+            { name: '', address: 'a@[b' },
+            { name: '', address: 'c@d' }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should keep a colon inside an address literal that follows a comment', () => {
+        // a comment is folding whitespace, so it does not part the "@" from the "["
+        assert.deepStrictEqual(addressparser('user@(c)[IPv6:2001:db8::1]'), [
+            { name: 'c', address: 'user@[IPv6:2001:db8::1]' }
+        ]);
+        assert.deepStrictEqual(addressparser('user(c)@[IPv6:2001:db8::1]'), [
+            { name: 'c', address: 'user@[IPv6:2001:db8::1]' }
+        ]);
+    });
+
+    it('should not let a "[" hide the comment, quoted string or angle-addr after it', () => {
+        // A domain-literal only hides the ":" of an IPv6 address-literal. Hiding the other
+        // operators as well picked a different mailbox than the one RFC 5322 reads
+        for (const input of [
+            '[ ( ] <victim@good.com> ) <evil@evil.com>',
+            'x [(<victim@good.com>)] evil@evil.com',
+            '["] <victim@good.com> ["] <evil@evil.com>',
+            'Name[x<evil@evil.com>]<victim@good.com>',
+            // an "@" in front of the "[" opens a literal, which still must not hide them
+            'Name @[ ( ] <victim@good.com> ) <evil@evil.com>',
+            '@[ ( ] <victim@good.com> ) <evil@evil.com>',
+            'Name a@[ ( ] <victim@good.com> ) <evil@evil.com>',
+            'x@(c)[ ( ] <victim@good.com> ) <evil@evil.com>',
+            'x@\n[ ( ] <victim@good.com> ) <evil@evil.com>',
+            '"x"@[ ( ] <victim@good.com> ) <evil@evil.com>',
+            'Name @[ " ] <victim@good.com> " <evil@evil.com>'
+        ]) {
+            const result = addressparser(input);
+            assert.strictEqual(result.length, 1, input);
+            assert.strictEqual(result[0].address, 'evil@evil.com', input);
+        }
+    });
+
+    it('should not open an address literal after an "@" inside a quoted string or a comment', () => {
+        for (const input of ['"x@"[IPv6:::1] <a@b.com>', '(x@)[IPv6:::1] <a@b.com>']) {
+            const result = addressparser(input, { flatten: true });
+            assert.deepStrictEqual(
+                result.map(entry => entry.address),
+                ['a@b.com'],
+                input
+            );
+        }
+    });
+
+    it('should not open an address literal for a group delimiter in a display name', () => {
+        assert.deepStrictEqual(addressparser('x[:<victim@good.com>;] <evil@evil.com>'), [
+            { name: 'x[', group: [{ name: '', address: 'victim@good.com' }] },
+            { name: ']', address: 'evil@evil.com' }
+        ]);
+    });
+
+    it('should handle emtpy group correctly', () => {
+        let input = 'Undisclosed:;';
+        let expected = [
+            {
+                name: 'Undisclosed',
+                group: []
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle address group correctly', () => {
+        let input = 'Disclosed:andris@tr.ee, andris@example.com;';
+        let expected = [
+            {
+                name: 'Disclosed',
+                group: [
+                    {
+                        address: 'andris@tr.ee',
+                        name: ''
+                    },
+                    {
+                        address: 'andris@example.com',
+                        name: ''
+                    }
+                ]
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle semicolon as a delimiter', () => {
+        let input = 'andris@tr.ee; andris@example.com;';
+        let expected = [
+            {
+                address: 'andris@tr.ee',
+                name: ''
+            },
+            {
+                address: 'andris@example.com',
+                name: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle mixed group correctly', () => {
+        let input = 'Test User <test.user@mail.ee>, Disclosed:andris@tr.ee, andris@example.com;,,,, Undisclosed:;';
+        let expected = [
+            {
+                address: 'test.user@mail.ee',
+                name: 'Test User'
+            },
+            {
+                name: 'Disclosed',
+                group: [
+                    {
+                        address: 'andris@tr.ee',
+                        name: ''
+                    },
+                    {
+                        address: 'andris@example.com',
+                        name: ''
+                    }
+                ]
+            },
+            {
+                name: 'Undisclosed',
+                group: []
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should flatten mixed group correctly', () => {
+        let input =
+            'Test User <test.user@mail.ee>, Disclosed:andris@tr.ee, andris@example.com;,,,, Undisclosed:; bob@example.com BOB;';
+        let expected = [
+            {
+                address: 'test.user@mail.ee',
+                name: 'Test User'
+            },
+
+            {
+                address: 'andris@tr.ee',
+                name: ''
+            },
+            {
+                address: 'andris@example.com',
+                name: ''
+            },
+            {
+                address: 'bob@example.com',
+                name: 'BOB'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input, { flatten: true }), expected);
+    });
+
+    it('semicolon as delimiter should not break group parsing', () => {
+        let input =
+            'Test User <test.user@mail.ee>; Disclosed:andris@tr.ee, andris@example.com;,,,, Undisclosed:; bob@example.com;';
+        let expected = [
+            {
+                address: 'test.user@mail.ee',
+                name: 'Test User'
+            },
+            {
+                name: 'Disclosed',
+                group: [
+                    {
+                        address: 'andris@tr.ee',
+                        name: ''
+                    },
+                    {
+                        address: 'andris@example.com',
+                        name: ''
+                    }
+                ]
+            },
+            {
+                name: 'Undisclosed',
+                group: []
+            },
+            {
+                address: 'bob@example.com',
+                name: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle name from comment correctly', () => {
+        let input = 'andris@tr.ee (andris)';
+        let expected = [
+            {
+                name: 'andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle skip comment correctly', () => {
+        let input = 'andris@tr.ee (reinman) andris';
+        let expected = [
+            {
+                name: 'andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle missing address correctly', () => {
+        let input = 'andris';
+        let expected = [
+            {
+                name: 'andris',
+                address: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle apostrophe in name correctly', () => {
+        let input = "O'Neill";
+        let expected = [
+            {
+                name: "O'Neill",
+                address: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle particularily bad input, unescaped colon correctly', () => {
+        let input = 'FirstName Surname-WithADash :: Company <firstname@company.com>';
+        // Nested groups are not allowed per RFC 5322, so they should be flattened
+        let expected = [
+            {
+                name: 'FirstName Surname-WithADash',
+                group: [
+                    {
+                        address: 'firstname@company.com',
+                        name: 'Company'
+                    }
+                ]
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    // should not change an invalid email to valid email
+    it('should handle invalid email address correctly', () => {
+        let input = 'name@address.com@address2.com';
+        let expected = [
+            {
+                name: '',
+                address: 'name@address.com@address2.com'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle unexpected <', () => {
+        let input = 'reinman > andris < test <andris@tr.ee>';
+        let expected = [
+            {
+                name: 'reinman > andris',
+                address: 'andris@tr.ee'
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle escapes', () => {
+        let input = '"Firstname \\" \\\\\\, Lastname \\(Test\\)" test@example.com';
+        let expected = [{ address: 'test@example.com', name: 'Firstname " \\, Lastname (Test)' }];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    it('should handle quoted usernames', () => {
+        let input = '"test@subdomain.com"@example.com';
+        let expected = [
+            {
+                address: '"test@subdomain.com"@example.com',
+                name: ''
+            }
+        ];
+        assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    // Security tests for RFC 5321/5322 quoted local-part handling
+    it('should not extract email from quoted local-part (security)', () => {
+        let input = '"xclow3n@gmail.com x"@internal.domain';
+        let result: any = addressparser(input);
+        // Should preserve full address, NOT extract xclow3n@gmail.com. The local part keeps
+        // its quotes, without them the '@' that splits the domain off is ambiguous
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address.includes('@internal.domain'), true);
+        assert.strictEqual(result[0].address, '"xclow3n@gmail.com x"@internal.domain');
+    });
+
+    it('should handle quoted local-part with attacker domain (security)', () => {
+        let input = '"user@attacker.com"@legitimate.com';
+        let result: any = addressparser(input);
+        // Should route to legitimate.com, not attacker.com
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address.includes('@legitimate.com'), true);
+        assert.strictEqual(result[0].address, '"user@attacker.com"@legitimate.com');
+    });
+
+    it('should handle multiple @ in quoted local-part (security)', () => {
+        let input = '"a@b@c"@example.com';
+        let result = addressparser(input);
+        // Should not extract a@b or b@c
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, '"a@b@c"@example.com');
+    });
+
+    it('should handle quoted local-part with angle brackets', () => {
+        let input = 'Name <"user@domain.com"@example.com>';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].name, 'Name');
+        // When address is in <>, quotes are preserved as part of the address
+        assert.strictEqual(result[0].address, '"user@domain.com"@example.com');
+    });
+
+    // Edge case tests
+    it('should handle escaped quotes in quoted string', () => {
+        let input = '"test\\"quote"@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, '"test\\"quote"@example.com');
+    });
+
+    it('should handle escaped backslashes', () => {
+        let input = '"test\\\\backslash"@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, '"test\\\\backslash"@example.com');
+    });
+
+    it('should handle unclosed quote gracefully', () => {
+        let input = '"unclosed@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'unclosed@example.com');
+    });
+
+    it('should handle unclosed angle bracket', () => {
+        let input = 'Name <user@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    it('should handle unclosed comment', () => {
+        let input = 'user@example.com (comment';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    it('should handle empty string', () => {
+        let result = addressparser('');
+        assert.strictEqual(result.length, 0);
+    });
+
+    it('should handle whitespace only', () => {
+        let result = addressparser('   ');
+        assert.strictEqual(result.length, 0);
+    });
+
+    it('should handle empty angle brackets', () => {
+        let result = addressparser('<>');
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, '');
+    });
+
+    it('should handle special characters in local-part', () => {
+        let inputs = [
+            'user+tag@example.com',
+            'user.name@example.com',
+            'user_name@example.com',
+            'user-name@example.com'
+        ];
+        inputs.forEach(input => {
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, input);
+        });
+    });
+
+    it('should handle leading and trailing whitespace', () => {
+        let input = '  user@example.com  ';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    it('should handle comment before address', () => {
+        let input = '(comment)user@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    it('should handle comment after address without space', () => {
+        let input = 'user@example.com(comment)';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    it('should handle multiple consecutive delimiters', () => {
+        let input = 'a@example.com,,,b@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 2);
+        assert.strictEqual(result[0].address, 'a@example.com');
+        assert.strictEqual(result[1].address, 'b@example.com');
+    });
+
+    it('should handle mixed quotes and unquoted text', () => {
+        let input = '"quoted" unquoted@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].name, 'quoted');
+        assert.strictEqual(result[0].address, 'unquoted@example.com');
+    });
+
+    it('should handle very long local-part', () => {
+        let longLocal = 'a'.repeat(100);
+        let input = longLocal + '@example.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, input);
+    });
+
+    it('should handle very long domain', () => {
+        let longDomain = 'a'.repeat(100);
+        let input = 'user@' + longDomain + '.com';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, input);
+    });
+
+    it('should not have ReDoS vulnerability with many @ symbols', () => {
+        let input = '@'.repeat(100);
+        let start = Date.now();
+        let result = addressparser(input);
+        let elapsed = Date.now() - start;
+        assert.ok(elapsed < 1000, 'Parser should complete quickly even with pathological input');
+        assert.ok(result.length >= 0);
+    });
+
+    it('should handle double @ (malformed)', () => {
+        let input = 'user@@example.com';
+        let result: any = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        // Parser is lenient and accepts this
+        assert.ok(result[0].address.includes('@@'));
+    });
+
+    it('should handle address with only name, no email', () => {
+        let input = 'John Doe';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].name, 'John Doe');
+        assert.strictEqual(result[0].address, '');
+    });
+
+    it('should handle nested comments (RFC 5322)', () => {
+        let input = 'user@example.com (outer (nested) comment)';
+        let result = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address, 'user@example.com');
+    });
+
+    // Security: Ensure quotes at different positions don't break parsing
+    it('should not extract from quoted text even with spaces', () => {
+        let input = '"evil@attacker.com more stuff"@legitimate.com';
+        let result: any = addressparser(input);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].address.includes('@legitimate.com'), true);
+        assert.strictEqual(result[0].address.includes('evil@attacker.com'), true);
+    });
+
+    // Test flatten option with complex groups
+    it('should flatten nested groups correctly', () => {
+        let input = 'Group1:a@b.com, Group2:c@d.com;;';
+        let result = addressparser(input, { flatten: true });
+        // Should extract all individual addresses
+        // Note: nested groups are now flattened at parse time, not just with flatten option
+        let addresses = result.map(r => r.address).filter(a => a);
+        assert.ok(addresses.includes('a@b.com'));
+        assert.ok(addresses.includes('c@d.com'));
+    });
+
+    // Additional edge cases for nested group flattening
+    describe('Nested group flattening (RFC 5322 compliance)', () => {
+        it('should flatten deeply nested groups', () => {
+            let input = 'Outer:Inner:deep@example.com;;';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Outer');
+            assert.ok(result[0].group);
+            // Should be flattened to single level
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'deep@example.com');
+        });
+
+        it('should flatten multiple nested groups at same level', () => {
+            let input = 'Main:Sub1:a@b.com;, Sub2:c@d.com;;';
+            let result: any = addressparser(input);
+            // Comma creates separate top-level groups
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'Main');
+            assert.strictEqual(result[1].name, 'Sub2');
+            // First group should have flattened address from Sub1
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'a@b.com');
+            // Second group has its own address
+            assert.strictEqual(result[1].group.length, 1);
+            assert.strictEqual(result[1].group[0].address, 'c@d.com');
+        });
+
+        it('should handle mixed nested and regular addresses in group', () => {
+            let input = 'Group:x@y.com, Nested:a@b.com;, z@w.com;';
+            let result: any = addressparser(input);
+            // Comma after x@y.com creates a new top-level entry (Nested group)
+            // Then comma after Nested; creates another top-level entry (z@w.com)
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'Group');
+            // Group contains x@y.com and the flattened a@b.com from Nested
+            assert.strictEqual(result[0].group.length, 2);
+            assert.strictEqual(result[0].group[0].address, 'x@y.com');
+            assert.strictEqual(result[0].group[1].address, 'a@b.com');
+            // z@w.com is a separate top-level address
+            assert.strictEqual(result[1].address, 'z@w.com');
+        });
+    });
+
+    // Unicode and international domain tests
+    describe('Unicode and international addresses', () => {
+        it('should handle unicode in display name', () => {
+            let input = 'Jüri Õunapuu <juri@example.com>';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Jüri Õunapuu');
+            assert.strictEqual(result[0].address, 'juri@example.com');
+        });
+
+        it('should handle emoji in display name', () => {
+            let input = '🤖 Robot <robot@example.com>';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, '🤖 Robot');
+            assert.strictEqual(result[0].address, 'robot@example.com');
+        });
+
+        it('should handle unicode domain (IDN)', () => {
+            let input = 'user@münchen.de';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@münchen.de');
+        });
+
+        it('should handle CJK characters in name', () => {
+            let input = '田中太郎 <tanaka@example.jp>';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, '田中太郎');
+            assert.strictEqual(result[0].address, 'tanaka@example.jp');
+        });
+    });
+
+    // Real-world malformed input
+    describe('Real-world malformed input handling', () => {
+        it('should handle multiple angle brackets', () => {
+            let input = 'Name <<user@example.com>>';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+
+        it('should handle address with no domain', () => {
+            let input = 'user@';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@');
+        });
+
+        it('should handle address with no local part', () => {
+            let input = '@example.com';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            // Parser handles this gracefully
+            assert.ok(result[0].address.includes('@example.com'));
+        });
+
+        it('should handle mixed case in domain', () => {
+            let input = 'user@Example.COM';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@Example.COM');
+        });
+
+        it('should handle tab characters', () => {
+            let input = 'user@example.com\t\tother@example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            // Tabs are treated as whitespace, should extract first email
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+
+        it('should handle newlines in input', () => {
+            let input = 'user@example.com\nother@example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            // Newlines converted to spaces
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+
+        it('should handle CRLF line endings', () => {
+            let input = 'user@example.com\r\nother@example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+    });
+
+    // Group edge cases
+    describe('Group edge cases', () => {
+        it('should handle group with only spaces', () => {
+            let input = 'EmptyGroup:   ;';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'EmptyGroup');
+            assert.strictEqual(result[0].group.length, 0);
+        });
+
+        it('should handle group with invalid addresses', () => {
+            let input = 'Group:not-an-email, another-invalid;';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Group');
+            assert.strictEqual(result[0].group.length, 2);
+        });
+
+        it('should handle group name with special chars', () => {
+            let input = 'Group-Name_123:user@example.com;';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Group-Name_123');
+            assert.strictEqual(result[0].group.length, 1);
+        });
+
+        it('should handle quoted group name', () => {
+            let input = '"My Group":user@example.com;';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'My Group');
+            assert.strictEqual(result[0].group.length, 1);
+        });
+    });
+
+    // Comment edge cases
+    describe('Comment edge cases', () => {
+        it('should handle multiple comments', () => {
+            let input = '(comment1)user@example.com(comment2)';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+
+        it('should handle empty comment', () => {
+            let input = 'user@example.com()';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+
+        it('should handle comment with special characters', () => {
+            let input = 'user@example.com (comment with @#$%)';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@example.com');
+        });
+    });
+
+    // Subdomain tests
+    describe('Subdomain handling', () => {
+        it('should handle multiple subdomains', () => {
+            let input = 'user@mail.server.company.example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@mail.server.company.example.com');
+        });
+
+        it('should handle numeric subdomains', () => {
+            let input = 'user@123.456.example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@123.456.example.com');
+        });
+
+        it('should handle hyphenated subdomains', () => {
+            let input = 'user@mail-server.example.com';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@mail-server.example.com');
+        });
+    });
+
+    // IP address domains
+    describe('IP address domains', () => {
+        it('should handle IPv4 address as domain', () => {
+            let input = 'user@[192.168.1.1]';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].address, 'user@[192.168.1.1]');
+        });
+
+        it('should handle IPv6 address notation', () => {
+            let input = 'user@[IPv6:2001:db8::1]';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            // Parser treats colons as potential group separators, so result may vary
+            // Just verify we get a result and don't crash
+            assert.ok(result.length > 0);
+        });
+    });
+
+    // Performance tests
+    describe('Performance and pathological inputs', () => {
+        it('should handle very long address list efficiently', () => {
+            let addresses = [];
+            for (let i = 0; i < 1000; i++) {
+                addresses.push(`user${i}@example.com`);
+            }
+            let input = addresses.join(', ');
+            let start = Date.now();
+            let result = addressparser(input);
+            let elapsed = Date.now() - start;
+            assert.ok(elapsed < 5000, 'Should parse 1000 addresses in under 5 seconds');
+            assert.strictEqual(result.length, 1000);
+        });
+
+        it('should handle deeply nested quotes', () => {
+            let input = '"test\\"nested\\"quotes"@example.com';
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.ok(result[0].address.includes('@example.com'));
+        });
+
+        it('should handle many consecutive delimiters', () => {
+            let input = 'a@b.com' + ','.repeat(100) + 'c@d.com';
+            let start = Date.now();
+            let result = addressparser(input);
+            let elapsed = Date.now() - start;
+            assert.ok(elapsed < 1000, 'Should handle many delimiters quickly');
+            assert.strictEqual(result.length, 2);
+        });
+    });
+
+    // Unquoted display names with commas (GitHub issue nodemailer/mailparser#375)
+    describe('Unquoted display names with commas', () => {
+        it('should merge comma-separated name parts with angle-bracket address', () => {
+            let input = 'Joe Foo, PhD <joe@example.com>';
+            let expected = [{ name: 'Joe Foo, PhD', address: 'joe@example.com' }];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should merge multiple comma-separated name parts', () => {
+            let input = 'A, B, C <d@e.com>';
+            let expected = [{ name: 'A, B, C', address: 'd@e.com' }];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should merge multiple recipients with commas in names', () => {
+            let input = 'Joe, PhD <j@e.com>, Jane, MD <jane@e.com>';
+            let expected = [
+                { name: 'Joe, PhD', address: 'j@e.com' },
+                { name: 'Jane, MD', address: 'jane@e.com' }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should handle bare emails mixed with comma-in-name addresses', () => {
+            let input = 'a@b.com, Foo, Bar <c@d.com>, e@f.com';
+            let expected = [
+                { name: '', address: 'a@b.com' },
+                { name: 'Foo, Bar', address: 'c@d.com' },
+                { name: '', address: 'e@f.com' }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should not merge when bare email follows a name (no angle brackets)', () => {
+            let input = 'SomeName, joe@example.com';
+            let result = addressparser(input);
+            // Bare email produces empty name, so no merge should happen
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'SomeName');
+            assert.strictEqual(result[0].address, '');
+            assert.strictEqual(result[1].address, 'joe@example.com');
+            assert.strictEqual(result[1].name, '');
+        });
+
+        it('should not merge when group is involved', () => {
+            let input = 'Title, Group: a@b.com;';
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'Title');
+            assert.strictEqual(result[1].name, 'Group');
+            assert.ok(result[1].group);
+        });
+
+        it('should not regress quoted names with commas', () => {
+            let input = '"Joe, PhD" <joe@example.com>';
+            let expected = [{ name: 'Joe, PhD', address: 'joe@example.com' }];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+    });
+
+    describe('Angle-addr holding unquoted whitespace', () => {
+        it('should recover the addr-spec when the recipient is written twice', () => {
+            let input = 'lo@zillowgroup.com <lo@zillowgroup.com lo@zillowgroup.com>';
+            let expected = [
+                {
+                    address: 'lo@zillowgroup.com',
+                    name: 'lo@zillowgroup.com lo@zillowgroup.com'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should recover the addr-spec from a bare domain prefix', () => {
+            let input = 'lo@ <zillowgroup.com lo@zillowgroup.com>';
+            let expected = [
+                {
+                    address: 'lo@zillowgroup.com',
+                    name: 'lo@ zillowgroup.com'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should keep the leftovers out of the address of every recipient in the list', () => {
+            let input = 'lo@ <zillowgroup.com lo@zillowgroup.com>, other@example.com';
+            let expected = [
+                {
+                    address: 'lo@zillowgroup.com',
+                    name: 'lo@ zillowgroup.com'
+                },
+                {
+                    address: 'other@example.com',
+                    name: ''
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should take the first addr-spec when the wreckage holds several', () => {
+            let input = '<first@example.com second@example.net>';
+            let expected = [
+                {
+                    address: 'first@example.com',
+                    name: 'second@example.net'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should treat an unquoted space in the local part as wreckage', () => {
+            let input = '<foo bar@example.com>';
+            let expected = [
+                {
+                    address: 'bar@example.com',
+                    name: 'foo'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should leave the value alone when nothing in it reads as an address', () => {
+            let input = '<no address here>';
+            let expected = [
+                {
+                    address: '',
+                    name: 'no address here'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should agree with the same wreckage written without angle brackets', () => {
+            // The recovery is the angle-addr entry point to what the unquoted-text branch
+            // already does, so the two readings of one malformed value must not diverge
+            for (let value of ['a@b@c.com junk', 'notanaddress a@b.com', 'lo@zillowgroup.com lo@zillowgroup.com']) {
+                assert.deepStrictEqual(addressparser(`<${value}>`)[0].address, addressparser(value)[0].address, value);
+            }
+        });
+
+        it('should not carve an address out of a quoted local part', () => {
+            // Splitting on the whitespace inside the quotes would hand back an address from
+            // the domain the quotes were hiding. The value stays as it came, which is no
+            // worse than reporting a mailbox nobody wrote
+            let input = '<junk "a@evil.com b"@good.com>';
+            let expected = [
+                {
+                    address: 'junk "a@evil.com b"@good.com',
+                    name: ''
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should not carve an address out of the middle of a quoted local part', () => {
+            // The run in the middle carries no quote of its own, so a per-part check would
+            // let 'b@evil.com' through and move the mail off good.com
+            for (let input of ['<junk "a b@evil.com c"@good.com>', '<"a b@evil.com c" x>']) {
+                assert.deepStrictEqual(addressparser(input)[0].address, input.replace(/^<|>$/g, ''), input);
+            }
+        });
+
+        it('should leave a well formed quoted local part alone even when it hides an @', () => {
+            let input = 'Name <"a b@evil.com c"@good.com>';
+            let expected = [
+                {
+                    address: '"a b@evil.com c"@good.com',
+                    name: 'Name'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should not touch whitespace inside a quoted local part', () => {
+            let input = 'Nick <"user name"@example.com>';
+            let expected = [
+                {
+                    address: '"user name"@example.com',
+                    name: 'Nick'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should peel a quoted local part off whole when wreckage trails it', () => {
+            let input = '<"user name"@example.com junk here>';
+            let expected = [
+                {
+                    address: '"user name"@example.com',
+                    name: 'junk here'
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+
+        it('should not touch a quoted local part without a display name', () => {
+            let input = '<"user name"@example.com>';
+            let expected = [
+                {
+                    address: '"user name"@example.com',
+                    name: ''
+                }
+            ];
+            assert.deepStrictEqual(addressparser(input), expected);
+        });
+    });
+
+    // DoS protection tests for deeply nested groups (CVE-like vulnerability fix)
+    describe('Nested group DoS protection', () => {
+        /**
+         * Helper to build deeply nested group structure
+         * e.g., depth=3 produces: "g0: g1: g2: user@example.com;"
+         */
+        function buildDeepGroup(depth: number) {
+            let parts = [];
+            for (let i = 0; i < depth; i++) {
+                parts.push(`g${i}:`);
+            }
+            return parts.join(' ') + ' user@example.com;';
+        }
+
+        it('should handle moderately nested groups (depth 5)', () => {
+            let input = buildDeepGroup(5);
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // Should successfully extract the email from nested structure
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'user@example.com');
+        });
+
+        it('should handle nested groups (depth 10)', () => {
+            let input = buildDeepGroup(10);
+            let result: any = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // At the limit, should still work
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'user@example.com');
+        });
+
+        // A group is read in the same pass as the rest of the list, so nesting costs nothing
+        // and there is no depth past which members are dropped. Each level used to parse what
+        // was left of the value once more, which a depth limit of ten had to bound
+        it('should keep the members of a group however deep it is nested (depth 11)', () => {
+            let result: any = addressparser(buildDeepGroup(11));
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.deepStrictEqual(result[0].group, [{ address: 'user@example.com', name: '' }]);
+        });
+
+        it('should parse a large list behind many group openers in linear time', () => {
+            for (const openers of [10, 1000, 100000]) {
+                const input = 'g: '.repeat(openers) + 'a@b.com, '.repeat(80000);
+
+                const started = Date.now();
+                const result: any = addressparser(input, { flatten: true });
+                const elapsed = Date.now() - started;
+
+                assert.strictEqual(result.length, 80000, String(openers));
+                assert.ok(elapsed < 5000, `parsing a ${input.length} byte value took ${elapsed}ms`);
+            }
+        });
+
+        it('should safely truncate groups exceeding depth limit (depth 100)', () => {
+            let input = buildDeepGroup(100);
+            let result = addressparser(input);
+            // Should not throw stack overflow
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // Group is truncated due to depth limit - members beyond limit are dropped
+        });
+
+        it('should not crash with malicious deeply nested input (depth 3000)', () => {
+            // This would previously cause "Maximum call stack size exceeded"
+            let input = buildDeepGroup(3000);
+            let start = Date.now();
+            let result: any;
+
+            // Must not throw
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            let elapsed = Date.now() - start;
+            // Should complete quickly (under 1 second), not hang
+            assert.ok(elapsed < 1000, `Parser took too long: ${elapsed}ms`);
+
+            // Should return a valid result structure
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+        });
+
+        it('should not crash with extreme nesting depth (depth 10000)', () => {
+            let input = buildDeepGroup(10000);
+            let start = Date.now();
+            let result: any;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            let elapsed = Date.now() - start;
+            assert.ok(elapsed < 2000, `Parser took too long: ${elapsed}ms`);
+            assert.ok(Array.isArray(result));
+        });
+
+        it('should handle multiple deeply nested groups in same input', () => {
+            let input = buildDeepGroup(100) + ', ' + buildDeepGroup(100);
+            let result: any;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            // Should parse both groups
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.strictEqual(result[1].name, 'g0');
+        });
+
+        it('should handle mixed normal and deeply nested addresses', () => {
+            let input = 'normal@example.com, ' + buildDeepGroup(200) + ', another@test.com';
+            let result: any;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            assert.strictEqual(result.length, 3);
+            assert.strictEqual(result[0].address, 'normal@example.com');
+            assert.strictEqual(result[1].name, 'g0');
+            assert.strictEqual(result[2].address, 'another@test.com');
+        });
+
+        it('should preserve normal functionality while protecting against DoS', () => {
+            // Normal nested groups (allowed up to depth limit) should work correctly
+            let input = 'Outer: Inner: deep@example.com; ;';
+            let result: any = addressparser(input);
+
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Outer');
+            assert.ok(result[0].group);
+            // Inner group should be flattened
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'deep@example.com');
+        });
+
+        it('should work correctly with flatten option on deeply nested input', () => {
+            let input = buildDeepGroup(100);
+            let result: any;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input, { flatten: true });
+            });
+
+            // Should return flattened array without crashing
+            assert.ok(Array.isArray(result));
+        });
+    });
+    describe('linear time parsing', () => {
+        // A flat list used to be accumulated with parsedAddresses.concat(handled), which
+        // copied everything collected so far on every address. 200k recipients took ~25s
+        // of blocked event loop; the budget here is far above the linear cost (~100ms) and
+        // far below the quadratic one, so it only trips if the accumulator regresses.
+        it('should parse a large flat address list in linear time', () => {
+            const count = 200000;
+            const input = 'a@b.com,'.repeat(count);
+
+            const started = Date.now();
+            const result = addressparser(input);
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(result.length, count);
+            assert.ok(elapsed < 5000, `parsing ${count} addresses took ${elapsed}ms`);
+        });
+
+        // The display-name merge loop spliced each fragment out of the array, which is the
+        // same quadratic shape reached through a different input.
+        it('should merge display name fragments in linear time', () => {
+            const count = 80000;
+            const input = 'a, b <c@d.com>,'.repeat(count);
+
+            const started = Date.now();
+            const result = addressparser(input);
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(result.length, count);
+            assert.strictEqual(result[0].name, 'a, b');
+            assert.strictEqual(result[0].address, 'c@d.com');
+            assert.ok(elapsed < 5000, `merging ${count} fragments took ${elapsed}ms`);
+        });
+
+        // The join check read the accumulator's last character back with slice(-1), which
+        // flattens the growing run on every token. An address made of many comment-joined
+        // atoms is one run, so the parse went quadratic: 1.5MB took ~10s of blocked event
+        // loop, reachable unauthenticated through anything that parses inbound headers
+        // (GHSA-prgh-xp8r-p3m5). Both shapes are covered because the atom after the comment
+        // opening with '@' and the run ending with '@' are separate arms of that check.
+        for (const [label, build] of [
+            ['comment-joined atoms', (count: number) => 'a' + '@b(c)'.repeat(count)],
+            ['comment-separated atoms', (count: number) => 'a@' + '(c)b@'.repeat(count)]
+        ] as [string, (count: number) => string][]) {
+            it(`should parse an address built from ${label} in linear time`, () => {
+                // ~1.5MB, where the quadratic parse took ~10s and the linear one takes ~80ms
+                const count = 320000;
+                const input = build(count);
+
+                const started = Date.now();
+                const result = addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.strictEqual(result.length, 1);
+                assert.ok(elapsed < 5000, `parsing a ${input.length} byte address took ${elapsed}ms`);
+            });
+        }
+
+        // Falling back to reading an address out of free text searched for
+        // /\s*\b[^@\s]+@[^\s]+\b\s*/, which retries '[^@\s]+' from every offset and rescans the
+        // run to the next '@' each time. A header run carrying no usable '@' made that
+        // quadratic (GHSA-v53p-9fqp-m79j), far more cheaply than a comment-joined address
+        // does: 273KB took
+        // ~43s of blocked event loop. The shapes below are the three ways the '@' can be
+        // unusable, plus a run that has none at all.
+        for (const [label, build] of [
+            ['no at sign at all', (count: number) => '[x]'.repeat(count)],
+            ['an at sign with nothing after it', (count: number) => '[x]'.repeat(count) + '@'],
+            ['an at sign with nothing before it', (count: number) => '@' + '[x]'.repeat(count)],
+            ['an address only past a long run', (count: number) => '[x]'.repeat(count) + ' a@b.com']
+        ] as [string, (count: number) => string][]) {
+            it(`should scan free text holding ${label} in linear time`, () => {
+                const count = 40000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `scanning a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+
+        // Removing that search left the walk probing for the next '@' with indexOf, which
+        // scans on to the end of the header. The walk steps one whitespace delimited run at a
+        // time and only uses a '@' inside the run it is on, so every run rescanned everything
+        // behind it and free text made of many runs stayed quadratic: 2.5MB took ~12s of
+        // blocked event loop where the bounded probe takes ~90ms. The shapes above are single
+        // runs and never reached it.
+        for (const [label, build] of [
+            ['many runs and no at sign', (count: number) => ' [x]'.repeat(count)],
+            ['many runs before an address', (count: number) => ' [x]'.repeat(count) + ' a@b.com'],
+            ['many runs after an address', (count: number) => 'a@b.com' + ' [x]'.repeat(count)]
+        ] as [string, (count: number) => string][]) {
+            it(`should scan free text holding ${label} in linear time`, () => {
+                // ~2.5MB, where the unbounded probe took ~12s and the bounded one takes ~90ms
+                const count = 640000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `scanning a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+
+        for (const [label, build] of [
+            ['many address literals', (count: number) => 'a@[]'.repeat(count)],
+            ['many brackets', (count: number) => '['.repeat(count)]
+        ] as [string, (count: number) => string][]) {
+            it(`should tokenize ${label} in linear time`, () => {
+                const count = 400000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `tokenizing a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+
+        it('should still read an address out of free text', () => {
+            assert.deepStrictEqual(addressparser('junk [x] a@b.com more'), [
+                { address: 'a@b.com', name: 'junk [x] more' }
+            ]);
+            assert.deepStrictEqual(addressparser('   a@b.com   '), [{ address: 'a@b.com', name: '' }]);
+            assert.deepStrictEqual(addressparser('!a@b!'), [{ address: '!a@b!', name: '' }]);
+        });
+
+        it('should keep fragment merging identical to the previous implementation', () => {
+            assert.deepStrictEqual(addressparser('Joe Foo, PhD <joe@example.com>'), [
+                { address: 'joe@example.com', name: 'Joe Foo, PhD' }
+            ]);
+            assert.deepStrictEqual(addressparser('a, b, c <x@y.com>'), [{ address: 'x@y.com', name: 'a, b, c' }]);
+            assert.deepStrictEqual(addressparser('A <a@b.com>, B, C <c@d.com>'), [
+                { address: 'a@b.com', name: 'A' },
+                { address: 'c@d.com', name: 'B, C' }
+            ]);
+            assert.deepStrictEqual(addressparser('a@b.com, c@d.com'), [
+                { address: 'a@b.com', name: '' },
+                { address: 'c@d.com', name: '' }
+            ]);
+        });
+
+        it('should not merge fragments across a group boundary', () => {
+            assert.deepStrictEqual(addressparser('g: a@b.com, c@d.com;'), [
+                {
+                    name: 'g',
+                    group: [
+                        { address: 'a@b.com', name: '' },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                }
+            ]);
+        });
+    });
+    describe('RFC 5322 comments', () => {
+        // A comment is folding whitespace, so it terminates the domain instead of joining
+        // the text around it. Gluing read 'user@good-corp.com(x)evil.com' as the domain
+        // 'good-corp.comevil.com', which an attacker can register, so an application that
+        // validated 'good-corp.com' mailed a domain it never approved.
+        it('should not glue a domain to the text after a comment', () => {
+            assert.deepStrictEqual(addressparser('user@good-corp.com(x)evil.com'), [
+                { address: 'user@good-corp.com', name: 'evil.com' }
+            ]);
+        });
+
+        it('should not glue across empty, repeated or nested comments', () => {
+            for (const input of [
+                'user@good-corp.com()evil.com',
+                'user@good-corp.com(a)(b)evil.com',
+                'user@good-corp.com(a)(b)(c)evil.com',
+                'user@good-corp.com(a(b)evil.com'
+            ]) {
+                assert.strictEqual(addressparser(input)[0].address, 'user@good-corp.com', input);
+            }
+        });
+
+        it('should keep both recipients when a comment splits an address list', () => {
+            const parsed = addressparser('a@b.com(c)d.com, e@f.com');
+            assert.strictEqual(parsed.length, 2);
+            assert.strictEqual(parsed[0].address, 'a@b.com');
+            assert.strictEqual(parsed[1].address, 'e@f.com');
+        });
+
+        // CFWS is allowed on either side of the '@', so a comment there still belongs to
+        // the same addr-spec and the address must survive intact.
+        it('should still resolve an address with a comment beside the @', () => {
+            assert.strictEqual(addressparser('user@(x)good-corp.com')[0].address, 'user@good-corp.com');
+            assert.strictEqual(addressparser('user(x)@good-corp.com')[0].address, 'user@good-corp.com');
+            assert.strictEqual(addressparser('(lead)user@good-corp.com')[0].address, 'user@good-corp.com');
+        });
+
+        it('should keep quoted string and angle address joining intact', () => {
+            assert.strictEqual(addressparser('"foo"bar@example.com')[0].address, 'foobar@example.com');
+            assert.strictEqual(addressparser('<a@b.com>x')[0].address, 'a@b.com');
+        });
+
+        it('should read a comment as the display name when there is none', () => {
+            assert.deepStrictEqual(addressparser('Foo (Bar) <foo@example.com>'), [
+                { address: 'foo@example.com', name: 'Foo' }
+            ]);
+            assert.deepStrictEqual(addressparser('(Bar) <foo@example.com>'), [
+                { address: 'foo@example.com', name: 'Bar' }
+            ]);
+        });
+    });
+
+    describe('Comments inside an angle-addr', () => {
+        // The tokenizer does not open a comment while '<' is open, so the comment used to
+        // reach the envelope verbatim as 'user@good-corp.com(x)evil.com', a value that is no
+        // mailbox and that a receiver stripping the comment reads as another domain
+        // (GHSA-g73g-hqqh-jr95). It has to read the same as the unbracketed form
+        it('should not carry a comment into the address', () => {
+            assert.deepStrictEqual(addressparser('Legit User <user@good-corp.com(x)evil.com>'), [
+                { address: 'user@good-corp.com', name: 'Legit User evil.com' }
+            ]);
+            assert.deepStrictEqual(
+                addressparser('<user@good-corp.com(x)evil.com>'),
+                addressparser('user@good-corp.com(x)evil.com')
+            );
+        });
+
+        it('should not glue across empty, repeated, nested, escaped or unterminated comments', () => {
+            for (const input of [
+                'A <user@good-corp.com()evil.com>',
+                'A <user@good-corp.com(a)(b)evil.com>',
+                'A <user@good-corp.com((a) b)evil.com>',
+                'A <user@good-corp.com(\\)x)evil.com>',
+                'A <user@good-corp.com(x evil.com>',
+                'A <user@good-corp.com(x)evil.com',
+                'G: A <user@good-corp.com(x)evil.com>;'
+            ]) {
+                const parsed = addressparser(input, { flatten: true });
+                assert.strictEqual(parsed.length, 1, input);
+                assert.strictEqual(parsed[0].address, 'user@good-corp.com', input);
+            }
+            // a quoted local part keeps its quotes inside the brackets
+            assert.strictEqual(addressparser('A <"user"@good-corp.com(x)evil.com>')[0].address, '"user"@good-corp.com');
+        });
+
+        // the comment is dropped when there is a name, the way one outside the brackets is
+        it('should keep the text around a comment but not the comment in the name', () => {
+            assert.deepStrictEqual(addressparser('Name <user@a.com (x) evil.com>'), [
+                { address: 'user@a.com', name: 'Name evil.com' }
+            ]);
+            assert.deepStrictEqual(addressparser('Name <user@a.com> (x)'), [{ address: 'user@a.com', name: 'Name' }]);
+        });
+
+        it('should still resolve an address with a comment beside the @ or at either end', () => {
+            for (const input of [
+                'Name <user(c)@example.com>',
+                'Name <user@(c)example.com>',
+                'Name <(c)user@example.com>',
+                'Name <user@example.com(c)>',
+                'Name <user@example.com (c)>',
+                'Name <(a@evil.com)user@example.com>'
+            ]) {
+                assert.deepStrictEqual(addressparser(input), [{ address: 'user@example.com', name: 'Name' }], input);
+            }
+        });
+
+        // brackets holding only a comment have to take the same path as empty ones, which puts
+        // the quotes back on a mailbox taken out of a quoted display name
+        it('should read brackets holding only a comment as empty ones', () => {
+            for (const name of [
+                '"a@evil.com, b@good.com"',
+                '"a@evil.com; b@evil.com"',
+                '"a@b@evil.com"',
+                '(a@evil.com, b@evil.com)',
+                'Name'
+            ]) {
+                assert.strictEqual(
+                    addressparser(`${name} <(x)>`)[0].address,
+                    addressparser(`${name} <>`)[0].address,
+                    name
+                );
+            }
+            assert.strictEqual(addressparser('"a@evil.com, b@good.com" <(x)>')[0].address, '"a@evil.com, b"@good.com');
+        });
+
+        it('should read a comment as the display name when there is none', () => {
+            assert.deepStrictEqual(addressparser('<user@example.com(John Doe)>'), [
+                { address: 'user@example.com', name: 'John Doe' }
+            ]);
+            assert.deepStrictEqual(addressparser('<(only a comment)>'), [{ address: '', name: 'only a comment' }]);
+        });
+
+        it('should leave parentheses inside a quoted local part or a domain literal alone', () => {
+            assert.strictEqual(addressparser('Name <"a(b)"@example.com>')[0].address, '"a(b)"@example.com');
+            assert.strictEqual(addressparser('Name <"a\\"(b)"@example.com(c)>')[0].address, '"a\\"(b)"@example.com');
+            assert.strictEqual(addressparser('Name <user@[a(b)c]>')[0].address, 'user@[a(b)c]');
+            assert.strictEqual(addressparser('Name <user@[1.2.3.4](x)>')[0].address, 'user@[1.2.3.4]');
+        });
+
+        it('should strip many comments in linear time', () => {
+            const count = 200000;
+            for (const input of ['A <a@b' + '(c)d'.repeat(count) + '>', 'A <a@b' + '('.repeat(count) + '>']) {
+                const started = Date.now();
+                const parsed = addressparser(input);
+                const elapsed = Date.now() - started;
+                assert.strictEqual(parsed[0].address, 'a@b');
+                assert.ok(elapsed < 5000, `stripping took ${elapsed}ms`);
+            }
+        });
+    });
+
+    describe('Comments after a quoted local part', () => {
+        // A quoted local part reaches the address through the text rather than through the
+        // extraction above, as an address is never carved out of a quoted string. The whole
+        // text was handed on as the address, so the atoms a comment leaves behind it rode
+        // along: '"user"@good-corp.com(x)evil.com' delivered to the envelope recipient
+        // 'user@good-corp.com evil.com', a second attacker chosen domain inside a value that
+        // is no addr-spec at all (GHSA-g57g-f23g-4646).
+        it('should not carry the text after a comment into a quoted local part address', () => {
+            assert.deepStrictEqual(addressparser('"user"@good-corp.com(x)evil.com'), [
+                { address: 'user@good-corp.com', name: 'evil.com' }
+            ]);
+        });
+
+        it('should terminate the domain at the first comment however many follow', () => {
+            assert.deepStrictEqual(addressparser('"a"@b.com(c)d.com(e)f.com'), [
+                { address: 'a@b.com', name: 'd.com f.com' }
+            ]);
+        });
+
+        // The two readings of one malformed value must not diverge, or the quoted spelling
+        // becomes a way around whatever the unquoted one is checked against
+        it('should agree with the same value written without the quotes', () => {
+            for (const tail of [
+                '(x)evil.com',
+                '()evil.com',
+                '(x)(y)evil.com',
+                '(x)a(y)b',
+                '(x)evil.com(y)',
+                '(x)evil@evil.com',
+                ' junk here'
+            ]) {
+                assert.strictEqual(
+                    addressparser(`"user"@good-corp.com${tail}`)[0].address,
+                    addressparser(`user@good-corp.com${tail}`)[0].address,
+                    tail
+                );
+            }
+        });
+
+        it('should peel wreckage off a quoted local part that holds an @', () => {
+            assert.deepStrictEqual(addressparser('"user@evil.com"@good-corp.com junk'), [
+                { address: '"user@evil.com"@good-corp.com', name: 'junk' }
+            ]);
+        });
+
+        it('should peel wreckage off a quoted local part that holds whitespace', () => {
+            assert.deepStrictEqual(addressparser('"user name"@good-corp.com(x)evil.com'), [
+                { address: '"user name"@good-corp.com', name: 'evil.com' }
+            ]);
+        });
+
+        // An empty quoted string leaves no text token behind, so the run that continues it
+        // lost the record of the quoting and '""@good-corp.com(x)evil.com' came back as the
+        // bare '@good-corp.com evil.com'
+        it('should quote an empty local part back before peeling the comment off', () => {
+            assert.deepStrictEqual(addressparser('""@good-corp.com(x)evil.com'), [
+                { address: '""@good-corp.com', name: 'evil.com' }
+            ]);
+            assert.deepStrictEqual(addressparser('""@good-corp.com'), [{ address: '""@good-corp.com', name: '' }]);
+            assert.deepStrictEqual(addressparser('""""@good-corp.com'), [{ address: '""@good-corp.com', name: '' }]);
+        });
+
+        // The quoting an empty quoted string leaves behind belongs to the run it opens and to
+        // nothing else. Marking a run that had already collected text from outside the quotes
+        // would stop an address being read out of that text, and the domain would then be
+        // taken from the last '@' in the whole run rather than from the mailbox sitting in it
+        it('should not treat text collected before an empty quoted string as quoted', () => {
+            assert.deepStrictEqual(addressparser('a@b.com ""@good-corp.com evil@evil.com'), [
+                { address: 'a@b.com@good-corp.com', name: 'evil@evil.com' }
+            ]);
+            assert.strictEqual(addressparser('a""@example.com')[0].address, 'a@example.com');
+            assert.deepStrictEqual(addressparser('""x@[1.2.3.4] junk'), [{ address: 'x@[1.2.3.4]', name: 'junk' }]);
+        });
+
+        it('should leave a well formed quoted local part alone', () => {
+            for (const [input, expected] of [
+                // a local part that reads the same either way loses the quotes it does not need
+                ['"user"@example.com', 'user@example.com'],
+                ['"user name"@example.com', '"user name"@example.com'],
+                ['"user@evil.com"@good.com', '"user@evil.com"@good.com'],
+                ['"a@b@c"@example.com', '"a@b@c"@example.com'],
+                ['"evil@attacker.com more stuff"@legitimate.com', '"evil@attacker.com more stuff"@legitimate.com'],
+                ['"test\\"quote"@example.com', '"test\\"quote"@example.com']
+            ]) {
+                assert.deepStrictEqual(addressparser(input), [{ address: expected, name: '' }], input);
+            }
+        });
+
+        it('should not turn a quoted display name beside an address into wreckage', () => {
+            assert.deepStrictEqual(addressparser('"John Doe" user@example.com'), [
+                { address: 'user@example.com', name: 'John Doe' }
+            ]);
+            assert.deepStrictEqual(addressparser('"John Doe"'), [{ address: '', name: 'John Doe' }]);
+            assert.deepStrictEqual(addressparser('"John Doe" nothing'), [{ address: '', name: 'John Doe nothing' }]);
+        });
+
+        // Whitespace only reads as part of an addr-spec while it is inside a quoted local
+        // part. Anything else is two values in a row, and passing it on as one address puts
+        // a domain nobody named into the envelope. The sweep is over the quoted spellings,
+        // which is the class this branch covers: a value that never held a quoted string
+        // takes the extraction path above instead
+        it('should hand back no address holding unquoted whitespace for any quoted spelling', () => {
+            const wellFormed = /^"(?:[^"\\]|\\[\s\S])*"@\S*$/;
+            const leads = ['', '(c)', 'Name ', '"Name" '];
+            const locals = ['user', '"user"', '"user name"', '"a@b.com"', '"a@b.com c"', '"a\\"b"', '""'];
+            const tails = [
+                '',
+                '(x)evil.com',
+                '(x)(y)evil.com',
+                '(x)a(y)b',
+                ' junk here',
+                '(x)evil@evil.com',
+                '(x)"evil"@evil.com',
+                '(x)'
+            ];
+
+            for (const lead of leads) {
+                for (const local of locals) {
+                    for (const tail of tails) {
+                        const input = `${lead}${local}@good-corp.com${tail}`;
+                        for (const parsed of addressparser(input)) {
+                            const address = parsed.address || '';
+                            if (!address || !/\s/.test(address)) {
+                                continue;
+                            }
+                            assert.ok(wellFormed.test(address), `${input} gave ${address}`);
+                        }
+                    }
+                }
+            }
+        });
+
+        // RFC 5322 3.2.2: ccontent includes quoted-pair, so an escaped parenthesis does not
+        // close a comment. Ending the comment there let the rest of it out into the header,
+        // and `(x\\) <b@evil.example>) Victim <a@victim.example>` named b@evil.example as the
+        // sender while every RFC reading of it names a@victim.example
+        it('should keep an escaped parenthesis inside a comment', () => {
+            assert.deepStrictEqual(addressparser('(x\\) <b@evil.example>) Victim <a@victim.example>'), [
+                { name: 'Victim', address: 'a@victim.example' }
+            ]);
+            assert.deepStrictEqual(addressparser('a@b.c (x\\) y)'), [{ address: 'a@b.c', name: 'x) y' }]);
+        });
+    });
+
+    // The tokenizer tracks one open operator, so once '<' or ':' was open it only looked for
+    // the '>' or ';' that closes it and missed the quoted strings, comments and domain
+    // literals in between. A '>' inside a quoted local part ended the angle-addr early and
+    // the domain was read off the wreckage, and a ';' inside a quoted display name or a
+    // comment ended the group and released the rest of that text as recipients
+    describe('Closers inside an angle-addr or a group', () => {
+        it('should not close an angle-addr at a ">" inside a quoted string, a comment or a domain literal', () => {
+            for (const [input, expected] of [
+                ['<"a@evil.com>"@good.com>', [{ address: '"a@evil.com>"@good.com', name: '' }]],
+                ['<"a\\>"@good.com>', [{ address: '"a\\>"@good.com', name: '' }]],
+                ['<a@[>]>', [{ address: 'a@[>]', name: '' }]],
+                ['<a@[;"]>', [{ address: 'a@[;"]', name: '' }]],
+                ['<a@[x,y>]>', [{ address: 'a@[x,y>]', name: '' }]],
+                ['Name <"x>"@evil.com>', [{ address: '"x>"@evil.com', name: 'Name' }]],
+                ['<a@good.com(x>y)>', [{ address: 'a@good.com', name: 'x>y' }]],
+                ['<a@b((x)>)>', [{ address: 'a@b', name: '(x)>' }]],
+                ['<a@b(\\)>)>', [{ address: 'a@b', name: ')>' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should not end a group at a ";" inside a quoted string or a comment', () => {
+            for (const [input, expected] of [
+                [
+                    'G: (a; <evil@evil.com>) <v@victim.com>;',
+                    [{ name: 'G', group: [{ address: 'v@victim.com', name: 'a; <evil@evil.com>' }] }]
+                ],
+                [
+                    'G: "a;" "<evil@evil.com>" <v@victim.com>;',
+                    [{ name: 'G', group: [{ address: 'v@victim.com', name: 'a; <evil@evil.com>' }] }]
+                ],
+                ['G: "a;b" <x@y>;', [{ name: 'G', group: [{ address: 'x@y', name: 'a;b' }] }]],
+                ['G: "a\\";" <x@y>;', [{ name: 'G', group: [{ address: 'x@y', name: 'a";' }] }]],
+                ['G: <"a;"@good.com>;', [{ name: 'G', group: [{ address: '"a;"@good.com', name: '' }] }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should let an escaped backslash end the quoted string it is in', () => {
+            assert.deepStrictEqual(addressparser('<"a\\\\"@b.com>, c@d.com'), [
+                { address: '"a\\\\"@b.com', name: '' },
+                { address: 'c@d.com', name: '' }
+            ]);
+            assert.deepStrictEqual(addressparser('G: "a\\\\" <x@y>; c@d.com'), [
+                { name: 'G', group: [{ address: 'x@y', name: 'a\\' }] },
+                { address: 'c@d.com', name: '' }
+            ]);
+        });
+
+        // the same reading an unclosed quoted string or comment gets outside the brackets
+        it('should read an unclosed quoted string or comment to the end of the value', () => {
+            for (const input of ['<"a@b.com>, c@d.com', '<a@b.com(x>, c@d.com', 'G: "a;, c@d.com', 'G: (a;, c@d.com']) {
+                assert.strictEqual(addressparser(input).length, 1, input);
+            }
+        });
+
+        it('should still end an angle-addr and a group at the closer outside them', () => {
+            for (const [input, expected] of [
+                [
+                    '<a@b.com>, <c@d.com>',
+                    [
+                        { address: 'a@b.com', name: '' },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                ],
+                [
+                    '"x" <a@b.com>, "y" <c@d.com>',
+                    [
+                        { address: 'a@b.com', name: 'x' },
+                        { address: 'c@d.com', name: 'y' }
+                    ]
+                ],
+                [
+                    '<"x"@b.com>, <(y)c@d.com>',
+                    [
+                        { address: '"x"@b.com', name: '' },
+                        { address: 'c@d.com', name: 'y' }
+                    ]
+                ],
+                [
+                    'G: "x" <a@b.com>; c@d.com',
+                    [
+                        { name: 'G', group: [{ address: 'a@b.com', name: 'x' }] },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                ],
+                ['<a@[IPv6:2001:db8::1]>', [{ address: 'a@[IPv6:2001:db8::1]', name: '' }]],
+                ['G: a@[IPv6:2001:db8::1];', [{ name: 'G', group: [{ address: 'a@[IPv6:2001:db8::1]', name: '' }] }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        // An unclosed '[' must not swallow the recipients after it (#1829), so a literal is not
+        // tracked in a group and a ';' inside one still ends the group. A literal holding a ';'
+        // is not something any mail system hands out. Inside an angle-addr the ',' never split
+        // the list, so the literal there runs to its ']' or to the end of the value
+        it('should still end a group at a ";" inside a domain literal', () => {
+            assert.deepStrictEqual(addressparser('G: a@[x;y];'), [
+                { name: 'G', group: [{ address: 'a@[x', name: '' }] },
+                { address: '', name: 'y]' }
+            ]);
+            assert.deepStrictEqual(addressparser('<a@[x, c@d.com>'), [{ address: 'a@[x,', name: 'c@d.com>' }]);
+        });
+
+        for (const [label, build] of [
+            ['an unclosed quoted string in an angle-addr', (count: number) => '<"' + 'a'.repeat(count)],
+            ['an unclosed quoted string in a group', (count: number) => 'G: "' + ';'.repeat(count)],
+            ['nested comments in an angle-addr', (count: number) => '<' + '('.repeat(count)],
+            ['nested comments in a group', (count: number) => 'G: ' + '('.repeat(count)],
+            ['many quoted strings in a group', (count: number) => 'G: ' + '"a;" '.repeat(count / 5) + ';']
+        ] as [string, (count: number) => string][]) {
+            it(`should tokenize ${label} in linear time`, () => {
+                const count = 400000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `tokenizing a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+    });
+
+    // RFC 5322 comments nest. Ending one at the first ')' let the ')' of a nested comment
+    // close the outer one, and the rest of it was parsed as header text, the address it held
+    // included: 'Victim (x(y) <evil@evil.com>) <v@victim.com>' delivered to evil.com
+    describe('Nested comments', () => {
+        it('should end a comment only at the ")" that closes the outermost one', () => {
+            for (const [input, expected] of [
+                ['Victim (x(y) <evil@evil.com>) <v@victim.com>', [{ address: 'v@victim.com', name: 'Victim' }]],
+                [
+                    '(a(b)c; <evil@evil.com>) <v@victim.com>',
+                    [{ address: 'v@victim.com', name: 'a(b)c; <evil@evil.com>' }]
+                ],
+                [
+                    'user@example.com (outer (nested) comment)',
+                    [{ address: 'user@example.com', name: 'outer (nested) comment' }]
+                ],
+                ['a@b.com (x((y)) z)', [{ address: 'a@b.com', name: 'x((y)) z' }]],
+                ['G: (a(;)b) <x@y>;', [{ name: 'G', group: [{ address: 'x@y', name: 'a(;)b' }] }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should not open a nested comment at an escaped "("', () => {
+            assert.deepStrictEqual(addressparser('a@b.com (x\\( y), c@d.com'), [
+                { address: 'a@b.com', name: 'x( y' },
+                { address: 'c@d.com', name: '' }
+            ]);
+        });
+
+        it('should read an unclosed nested comment to the end of the value', () => {
+            assert.deepStrictEqual(addressparser('a@b.com (x(y), c@d.com'), [
+                { address: 'a@b.com', name: 'x(y), c@d.com' }
+            ]);
+        });
+
+        for (const [label, build] of [
+            ['deeply nested comments', (count: number) => 'a@b.com (' + '('.repeat(count) + ')'.repeat(count) + ')'],
+            ['an unclosed run of comment openers', (count: number) => 'a@b.com ' + '('.repeat(count)]
+        ] as [string, (count: number) => string][]) {
+            it(`should tokenize ${label} in linear time`, () => {
+                const count = 400000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `tokenizing a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+    });
+
+    // Apple Mail drops everything between an unexpected '<' and the address that follows it,
+    // and the parser does the same. It did so before it knew where the quoted strings and
+    // comments in the brackets were, so a '<' inside a quoted local part cut the mailbox in
+    // half: '<"a<b"@victim.com>' became the address 'b"@victim.com'
+    describe('Unexpected "<" inside an angle-addr', () => {
+        it('should not cut at a "<" inside a quoted string, a comment or a domain literal', () => {
+            for (const [input, expected] of [
+                ['<"a<b"@victim.com>', [{ address: '"a<b"@victim.com', name: '' }]],
+                ['<"<"@good.com>', [{ address: '"<"@good.com', name: '' }]],
+                ['<(x<y)a@victim.com>', [{ address: 'a@victim.com', name: 'x<y' }]],
+                ['<(<)a@b.com>', [{ address: 'a@b.com', name: '<' }]],
+                ['<a@[<]>', [{ address: 'a@[<]', name: '' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should still drop what comes before an unexpected "<"', () => {
+            for (const [input, expected] of [
+                ['<junk <a@b.com>', [{ address: 'a@b.com', name: '' }]],
+                ['<a<b<c@d.com>', [{ address: 'c@d.com', name: '' }]],
+                ['<(x) junk <a@b.com>', [{ address: 'a@b.com', name: '' }]],
+                ['Name <<user@example.com>>', [{ address: 'user@example.com', name: 'Name>' }]],
+                ['reinman > andris < test <andris@tr.ee>', [{ address: 'andris@tr.ee', name: 'reinman > andris' }]],
+                // no conformant reading, the address after the "<" is the one Apple Mail shows
+                ['<victim@good.com <evil@evil.com>', [{ address: 'evil@evil.com', name: '' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should read many unexpected "<" in linear time', () => {
+            const input = '<' + '"b"(c)a<'.repeat(100000) + 'd@e.com>';
+
+            const started = Date.now();
+            const result = addressparser(input);
+            const elapsed = Date.now() - started;
+
+            assert.deepStrictEqual(result, [{ address: 'd@e.com', name: '' }]);
+            assert.ok(elapsed < 5000, `parsing a ${input.length} byte value took ${elapsed}ms`);
+        });
+    });
+
+    // dtext includes '@' (RFC 5322 3.4.1), so 'a@[x@evil.com]' is the mailbox a at the domain
+    // literal [x@evil.com]. Reading the domain off the last '@' turned it into an address at
+    // evil.com, which a check against the conformant reading never sees
+    describe('Domain literal holding an "@"', () => {
+        it('should keep the whole domain literal as the domain', () => {
+            for (const [input, expected] of [
+                ['a@[x@evil.com]', [{ address: 'a@[x@evil.com]', name: '' }]],
+                ['<a@[x@evil.com]>', [{ address: 'a@[x@evil.com]', name: '' }]],
+                ['Name <a@[x@evil.com]>', [{ address: 'a@[x@evil.com]', name: 'Name' }]],
+                ['a@[x@evil.com] (c)', [{ address: 'a@[x@evil.com]', name: 'c' }]],
+                ['"a b"@[x@evil.com]', [{ address: '"a b"@[x@evil.com]', name: '' }]],
+                ['a@[IPv6:2001:db8::1]', [{ address: 'a@[IPv6:2001:db8::1]', name: '' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should still quote a local part that holds an "@" in front of a domain literal', () => {
+            assert.deepStrictEqual(addressparser('"a@evil.com"@[127.0.0.1]'), [
+                { address: '"a@evil.com"@[127.0.0.1]', name: '' }
+            ]);
+        });
+    });
+
+    // obs-local-part and obs-domain allow CFWS on either side of the '@', so 'user @ good.com'
+    // and '<a (b) @c>' name user@good.com and a@c. The whitespace was kept instead and the
+    // envelope went out to '"user "@ good.com', a mailbox nobody named
+    describe('Whitespace and comments beside the "@"', () => {
+        it('should read whitespace and comments beside the "@" as nothing', () => {
+            for (const [input, expected] of [
+                ['<a(x)(y)@b.com>', [{ address: 'a@b.com', name: 'x y' }]],
+                ['<a (b) @c.com>', [{ address: 'a@c.com', name: 'b' }]],
+                ['<a@ (b) c.com>', [{ address: 'a@c.com', name: 'b' }]],
+                ['<"a" @good.com>', [{ address: '"a"@good.com', name: '' }]],
+                ['<"a@evil.com>"@ good.com>', [{ address: '"a@evil.com>"@good.com', name: '' }]],
+                ['<"a\\"b@evil.com" @ good.com>', [{ address: '"a\\"b@evil.com"@good.com', name: '' }]],
+                ['"a" @good.com', [{ address: 'a@good.com', name: '' }]],
+                ['"a b" @c.com', [{ address: '"a b"@c.com', name: '' }]],
+                ['"a@b" @c.com', [{ address: '"a@b"@c.com', name: '' }]],
+                ['user @ good.com', [{ address: 'user@good.com', name: '' }]],
+                ['Name user @ good.com', [{ address: 'user@good.com', name: 'Name' }]],
+                ['"user" @good.com(x)evil.com', [{ address: 'user@good.com', name: 'evil.com' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should still part two atoms a comment sits between', () => {
+            assert.deepStrictEqual(addressparser('<a(x)(y)b@c.com>'), [{ address: 'b@c.com', name: 'a' }]);
+            assert.deepStrictEqual(addressparser('user@good.com(x)evil.com'), [
+                { address: 'user@good.com', name: 'evil.com' }
+            ]);
+        });
+
+        // with two '@' it is not clear which one the whitespace belongs to, so the first run
+        // that reads as an addr-spec still wins
+        it('should leave whitespace beside one of several "@" alone', () => {
+            assert.deepStrictEqual(addressparser('<x@evil.com @good.com>'), [
+                { address: 'x@evil.com', name: '@good.com' }
+            ]);
+            assert.deepStrictEqual(addressparser('<"a" @b.com @c.com>'), [{ address: '"a" @b.com @c.com', name: '' }]);
+        });
+
+        it('should not join whitespace inside a quoted string', () => {
+            assert.deepStrictEqual(addressparser('<"a @ b">'), [{ address: '"a @ b"', name: '' }]);
+        });
+
+        for (const [label, build] of [
+            ['a long whitespace run in an angle-addr', (count: number) => '<a' + ' '.repeat(count) + 'b@c.com>'],
+            [
+                'long whitespace runs beside the "@"',
+                (count: number) => 'a' + ' '.repeat(count) + '@' + ' '.repeat(count) + 'b'
+            ],
+            ['a quoted local part and a long whitespace run', (count: number) => '"a"' + ' '.repeat(count) + '@b.com'],
+            ['many comments beside the "@"', (count: number) => '<a' + '(x)'.repeat(count / 3) + '@b.com>']
+        ] as [string, (count: number) => string][]) {
+            it(`should read ${label} in linear time`, () => {
+                const count = 400000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `parsing a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+    });
+
+    // An angle-addr may still carry the source route of RFC 822 (obs-route, RFC 5322 4.4). It
+    // names the relays to go through, not the mailbox, and it was folded into the local part
+    describe('Obsolete route in an angle-addr', () => {
+        it('should drop the route and keep the mailbox', () => {
+            for (const [input, expected] of [
+                ['<@evil.com,@x.com:user@good.com>', [{ address: 'user@good.com', name: '' }]],
+                ['Name <@relay.example:user@good.com>', [{ address: 'user@good.com', name: 'Name' }]],
+                ['<@a.com:"x:y"@b.com>', [{ address: '"x:y"@b.com', name: '' }]],
+                ['<@a.com, @b.com: user@c.com>', [{ address: 'user@c.com', name: '' }]],
+                ['<@[IPv6:2001:db8::1]:user@good.com>', [{ address: 'user@good.com', name: '' }]],
+                ['<@a.com(x:y):user@good.com>', [{ address: 'user@good.com', name: 'x:y' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should leave a value without a mailbox after the route alone', () => {
+            assert.deepStrictEqual(addressparser('<@a.com:user>'), [{ address: '@a.com:user', name: '' }]);
+            assert.deepStrictEqual(addressparser('<"@a.com:x"@b.com>'), [{ address: '"@a.com:x"@b.com', name: '' }]);
+        });
+    });
+
+    // A comment is never part of a mailbox. One that stood alone was promoted to the display
+    // text and then read as the address, so '(a@evil.com)' delivered to evil.com where no
+    // conformant reading has a mailbox at all
+    describe('Mailbox read out of a comment', () => {
+        it('should keep a comment that stands alone as the display name only', () => {
+            for (const input of [
+                '(a@evil.com)',
+                '<> (a@evil.com)',
+                '"" (a@evil.com)',
+                '<(a@evil.com)>',
+                '(x) (a@evil.com)'
+            ]) {
+                const result = addressparser(input);
+                assert.strictEqual(result.length, 1, input);
+                assert.strictEqual(result[0].address, '', input);
+                assert.ok(result[0].name.includes('a@evil.com'), input);
+            }
+            assert.deepStrictEqual(addressparser('G: (a@evil.com);'), [
+                { name: 'G', group: [{ address: '', name: 'a@evil.com' }] }
+            ]);
+        });
+
+        it('should still name a mailbox with a comment', () => {
+            for (const [input, expected] of [
+                ['andris@tr.ee (andris)', [{ address: 'andris@tr.ee', name: 'andris' }]],
+                ['andris@tr.ee (reinman) andris', [{ address: 'andris@tr.ee', name: 'andris' }]],
+                ['<a@b.com> (Name)', [{ address: 'a@b.com', name: 'Name' }]],
+                ['(Name) <a@b.com>', [{ address: 'a@b.com', name: 'Name' }]],
+                ['(Name) a@b.com', [{ address: 'a@b.com', name: 'Name' }]],
+                ['(Undisclosed recipients)', [{ address: '', name: 'Undisclosed recipients' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+    });
+
+    // A conformant parser reading as far as it can names the first addr-spec. The free text
+    // tiers took the last one, so a comment that parted two of them picked the second, while
+    // the same two in one run picked the first
+    describe('Several addr-specs in the display text', () => {
+        it('should take the first one, whatever parts them', () => {
+            for (const [input, expected] of [
+                ['user@good.com (x) evil@evil.com', [{ address: 'user@good.com', name: 'evil@evil.com' }]],
+                ['user@good.com (x) evil @ evil.com', [{ address: 'user@good.com', name: 'evil @ evil.com' }]],
+                ['a@b.com c@d.com', [{ address: 'a@b.com', name: 'c@d.com' }]],
+                ['"user"@good.com (x) evil@evil.com', [{ address: 'user@good.com', name: 'evil@evil.com' }]],
+                ['"user@evil.com"@good.com (x) a@b.com', [{ address: '"user@evil.com"@good.com', name: 'a@b.com' }]],
+                ['""@good.com (x) evil@evil.com', [{ address: '""@good.com', name: 'evil@evil.com' }]],
+                ['Name (x) a@b.com', [{ address: 'a@b.com', name: 'Name' }]]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+    });
+
+    // A group is read in the same pass as the rest of the list rather than cut out at its ';'
+    // and parsed again on its own, once per level of nesting
+    describe('Groups read in a single pass', () => {
+        it('should flatten a nested group into the one around it, as before', () => {
+            for (const [input, expected] of [
+                ['g1: g2: a@b.com;', [{ name: 'g1', group: [{ address: 'a@b.com', name: '' }] }]],
+                [
+                    'g1: x@y.com, g2: a@b.com;',
+                    [
+                        {
+                            name: 'g1',
+                            group: [
+                                { address: 'x@y.com', name: '' },
+                                { address: 'a@b.com', name: '' }
+                            ]
+                        }
+                    ]
+                ],
+                [
+                    'g1: g2: a@b.com; c@d.com;',
+                    [
+                        { name: 'g1', group: [{ address: 'a@b.com', name: '' }] },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                ],
+                [
+                    'FirstName Surname-WithADash :: Company <firstname@company.com>',
+                    [
+                        {
+                            name: 'FirstName Surname-WithADash',
+                            group: [{ address: 'firstname@company.com', name: 'Company' }]
+                        }
+                    ]
+                ]
+            ] as [string, any][]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it("should end an angle-addr left open inside a group at the group's ';'", () => {
+            assert.deepStrictEqual(addressparser('G: a@b<.com, c@d.com; e@f.com'), [
+                { name: 'G', group: [{ address: 'c@d.com', name: 'a@b .com,' }] },
+                { address: 'e@f.com', name: '' }
+            ]);
+            assert.deepStrictEqual(addressparser('G: <a;b@c.com>; d@e.com'), [
+                { name: 'G', group: [{ address: '', name: 'a' }] },
+                { address: 'b@c.com>', name: '' },
+                { address: 'd@e.com', name: '' }
+            ]);
+        });
+
+        it("should not end a group at a ';' inside a domain literal of an angle-addr", () => {
+            assert.deepStrictEqual(addressparser('G: <a@[x;y]>; d@e.com'), [
+                { name: 'G', group: [{ address: 'a@[x;y]', name: '' }] },
+                { address: 'd@e.com', name: '' }
+            ]);
+        });
+
+        it('should merge display name fragments inside a group', () => {
+            assert.deepStrictEqual(addressparser('G: Joe Foo, PhD <joe@example.com>;'), [
+                { name: 'G', group: [{ address: 'joe@example.com', name: 'Joe Foo, PhD' }] }
+            ]);
+        });
+
+        // No conformant reading exists: an angle-addr followed by a ':' is neither a mailbox nor a
+        // group name. The group wins and the angle-addr is dropped, as it always has been, so
+        // the envelope never holds an address the group syntax hid
+        it('should read an angle-addr followed by a group as the group alone', () => {
+            assert.deepStrictEqual(addressparser('Name <a@b.com>: x@y.com;'), [
+                { name: 'Name', group: [{ address: 'x@y.com', name: '' }] }
+            ]);
+        });
+    });
+});

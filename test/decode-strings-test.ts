@@ -1,0 +1,891 @@
+import { Buffer } from 'node:buffer';
+import test from 'node:test';
+import assert from 'node:assert';
+import {
+    decodeWord,
+    decodeWords,
+    decodeURIComponentWithCharset,
+    decodeCharset,
+    decodeText,
+    getDecoder,
+    isUtf8,
+    blobToArrayBuffer,
+    decodeBase64,
+    decodeParameterValueContinuations
+} from '../src/decode-strings.js';
+import type { StructuredHeader } from '../src/decode-strings.js';
+
+// MIME Encoded-Word Decoding Tests (decodeWord)
+test('decodeWord - Q-encoding simple ASCII', () => {
+    const result = decodeWord('utf-8', 'Q', 'Hello_World');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeWord - Q-encoding with hex sequences', () => {
+    const result = decodeWord('utf-8', 'Q', 'Caf=C3=A9');
+    assert.strictEqual(result, 'Café');
+});
+
+test('decodeWord - Q-encoding with underscores', () => {
+    const result = decodeWord('utf-8', 'Q', 'Hello_World_Test');
+    assert.strictEqual(result, 'Hello World Test');
+});
+
+test('decodeWord - Q-encoding mixed', () => {
+    const result = decodeWord('utf-8', 'Q', 'na=C3=AFve');
+    assert.strictEqual(result, 'naïve');
+});
+
+test('decodeWord - Q-encoding case insensitive', () => {
+    const result = decodeWord('utf-8', 'q', 'Test_123');
+    assert.strictEqual(result, 'Test 123');
+});
+
+test('decodeWord - Q-encoding with spaces after equals', () => {
+    // Should handle improperly formatted sequences like "= C3"
+    const result = decodeWord('utf-8', 'Q', 'Test=C3=A9');
+    assert.strictEqual(result, 'Testé');
+});
+
+test('decodeWord - B-encoding simple ASCII', () => {
+    const result = decodeWord('utf-8', 'B', 'SGVsbG8gV29ybGQ=');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeWord - B-encoding UTF-8', () => {
+    const result = decodeWord('utf-8', 'B', 'Q2Fmw6k=');
+    assert.strictEqual(result, 'Café');
+});
+
+test('decodeWord - B-encoding case insensitive', () => {
+    const result = decodeWord('utf-8', 'b', 'VGVzdA==');
+    assert.strictEqual(result, 'Test');
+});
+
+test('decodeWord - B-encoding with whitespace (stripped)', () => {
+    const result = decodeWord('utf-8', 'B', 'SGVs bG8g V29y bGQ=');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeWord - B-encoding with newlines (stripped)', () => {
+    const result = decodeWord('utf-8', 'B', 'SGVs\nbG8g\nV29y\nbGQ=');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeWord - RFC2231 language tag', () => {
+    // Language tag should be ignored
+    const result = decodeWord('utf-8*en', 'Q', 'Hello');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeWord - ISO-8859-1 charset', () => {
+    const result = decodeWord('ISO-8859-1', 'Q', 'Caf=E9');
+    assert.strictEqual(result, 'Café');
+});
+
+test('decodeWord - windows-1252 charset', () => {
+    const result = decodeWord('windows-1252', 'Q', 'Test');
+    assert.strictEqual(result, 'Test');
+});
+
+test('decodeWord - unknown charset fallback', () => {
+    // Should fallback to windows-1252
+    const result = decodeWord('unknown-charset', 'Q', 'Test');
+    assert.strictEqual(result, 'Test');
+});
+
+test('decodeWord - unknown encoding', () => {
+    // Unknown encoding should keep as-is
+    const result = decodeWord('utf-8', 'X', 'Test');
+    assert.strictEqual(result, 'Test');
+});
+
+test('decodeWord - Q-encoding empty string', () => {
+    const result = decodeWord('utf-8', 'Q', '');
+    assert.strictEqual(result, '');
+});
+
+test('decodeWord - B-encoding empty string', () => {
+    const result = decodeWord('utf-8', 'B', '');
+    assert.strictEqual(result, '');
+});
+
+// Multiple Encoded-Words Tests (decodeWords)
+test('decodeWords - single encoded word', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?=');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeWords - multiple encoded words same charset', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?= =?utf-8?Q?World?=');
+    assert.strictEqual(result, 'HelloWorld');
+});
+
+test('decodeWords - multiple encoded words different charset', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?= =?iso-8859-1?Q?World?=');
+    assert.ok(result.includes('Hello'));
+    assert.ok(result.includes('World'));
+});
+
+test('decodeWords - mixed encoded and plain text', () => {
+    const result = decodeWords('Plain =?utf-8?Q?Encoded?= More Plain');
+    assert.strictEqual(result, 'Plain Encoded More Plain');
+});
+
+test('decodeWords - consecutive base64 words joined', () => {
+    // Base64 words with matching charset should be joined
+    const result = decodeWords('=?utf-8?B?SGVs?= =?utf-8?B?bG8=?=');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeWords - consecutive QP words joined', () => {
+    // QP words with matching charset should be joined
+    const result = decodeWords('=?utf-8?Q?Hel?= =?utf-8?Q?lo?=');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeWords - a pad ends the run of joined base64 words', () => {
+    // the pad check sees the last word appended, not the text joined so far, so the state
+    // it keeps has to follow every join
+    assert.strictEqual(decodeWords('=?utf-8?B?SGVs?= =?utf-8?B?bG8=?= =?utf-8?B?IQ==?='), 'Hello!');
+    assert.strictEqual(decodeWords('=?utf-8?B?SGVs?= =?utf-8?B?bG8=?= =?utf-8?B?V29ybGQ=?='), 'HelloWorld');
+    // an empty word leaves the pad where it was
+    assert.strictEqual(decodeWords('=?utf-8?B?SGVs?= =?utf-8?B??= =?utf-8?B?bG8=?='), 'Hello');
+    assert.strictEqual(decodeWords('=?utf-8?B?SGVsbG8=?= =?utf-8?B??= =?utf-8?B?V29ybGQ=?='), 'HelloWorld');
+});
+
+test('decodeWords - B-encoding words not joined if incomplete', () => {
+    // If base64 ends with =, should not join
+    const result = decodeWords('=?utf-8?B?SGVsbG8=?= =?utf-8?B?V29ybGQ=?=');
+    assert.ok(result.includes('Hello'));
+    assert.ok(result.includes('World'));
+});
+
+test('decodeWords - no encoded words', () => {
+    const result = decodeWords('Just plain text');
+    assert.strictEqual(result, 'Just plain text');
+});
+
+test('decodeWords - empty string', () => {
+    const result = decodeWords('');
+    assert.strictEqual(result, '');
+});
+
+test('decodeWords - malformed encoded word', () => {
+    const result = decodeWords('=?utf-8?Q?Invalid'); // Missing ?=
+    assert.ok(result.includes('=?utf-8?Q?Invalid'));
+});
+
+test('decodeWords - Japanese characters', () => {
+    const result = decodeWords('=?UTF-8?B?44GT44KT44Gr44Gh44Gv?=');
+    assert.strictEqual(result, 'こんにちは');
+});
+
+test('decodeWords - multiple scripts', () => {
+    const result = decodeWords('=?utf-8?Q?Caf=C3=A9?= and =?utf-8?B?44GT44KT44Gr44Gh44Gv?=');
+    assert.ok(result.includes('Café'));
+    assert.ok(result.includes('こんにちは'));
+});
+
+test('decodeWords - spaces between different charset words preserved', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?= =?iso-8859-1?Q?World?=');
+    // Space should be preserved when charsets differ
+    assert.ok(result.includes('Hello'));
+    assert.ok(result.includes('World'));
+});
+
+test('decodeWords - retry without joining on unicode error', () => {
+    // If joining produces \ufffd, should retry without joining
+    // This tests the fallback mechanism
+    const result = decodeWords('=?utf-8?B?dGVzdA==?= =?utf-8?B?dGVzdA==?=');
+    assert.ok(result.includes('test'));
+});
+
+test('decodeWords - case insensitive encoding type', () => {
+    const result = decodeWords('=?utf-8?q?test?= =?utf-8?b?dGVzdA==?=');
+    assert.ok(result.includes('test'));
+});
+
+test('decodeWords - multiple consecutive spaces', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?=   =?utf-8?Q?World?=');
+    assert.ok(result.includes('Hello'));
+    assert.ok(result.includes('World'));
+});
+
+test('decodeWords - newlines between encoded words', () => {
+    const result = decodeWords('=?utf-8?Q?Hello?=\n =?utf-8?Q?World?=');
+    assert.ok(result.includes('Hello'));
+    assert.ok(result.includes('World'));
+});
+
+test('decodeWords - special characters in charset name', () => {
+    const result = decodeWords('=?utf-8*en-US?Q?Hello?=');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeWords - very long encoded word', () => {
+    const longText = 'A'.repeat(100);
+    const encoded = Buffer.from(longText).toString('base64');
+    const result = decodeWords(`=?utf-8?B?${encoded}?=`);
+    assert.strictEqual(result, longText);
+});
+
+test('decodeWords - line breaks inside an encoded word are folded into spaces', () => {
+    // A header value holds no line breaks. A consumer writing the decoded name or subject
+    // into a header of its own would otherwise be handed a header injection
+    assert.strictEqual(decodeWords('=?utf-8?Q?Name=0D=0AInjected=3A_x?='), 'Name Injected: x');
+    // base64 of 'a\r\n\r\nb\nc'
+    assert.strictEqual(decodeWords('=?utf-8?B?YQ0KDQpiCmM=?='), 'a b c');
+});
+
+// URI Decoding with Charset Tests
+test('decodeURIComponentWithCharset - line breaks are kept', () => {
+    // RFC 2231 also encodes the boundary, which a fold would turn from a value no line can
+    // match into one that splits the body, so folding is left to the filename consumer
+    assert.strictEqual(decodeURIComponentWithCharset('a%0D%0Ab', 'utf-8'), 'a\r\nb');
+});
+
+test('decodeURIComponentWithCharset - simple ASCII', () => {
+    const result = decodeURIComponentWithCharset('Hello%20World', 'utf-8');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeURIComponentWithCharset - UTF-8 encoded', () => {
+    const result = decodeURIComponentWithCharset('Caf%C3%A9', 'utf-8');
+    assert.strictEqual(result, 'Café');
+});
+
+test('decodeURIComponentWithCharset - default charset', () => {
+    const result = decodeURIComponentWithCharset('Test%20123');
+    assert.strictEqual(result, 'Test 123');
+});
+
+test('decodeURIComponentWithCharset - high ASCII chars', () => {
+    const result = decodeURIComponentWithCharset('Test%E2%9C%93', 'utf-8');
+    assert.strictEqual(result, 'Test✓');
+});
+
+test('decodeURIComponentWithCharset - mixed encoded and plain', () => {
+    const result = decodeURIComponentWithCharset('Hello%20World%21', 'utf-8');
+    assert.strictEqual(result, 'Hello World!');
+});
+
+test('decodeURIComponentWithCharset - no encoding', () => {
+    const result = decodeURIComponentWithCharset('PlainText', 'utf-8');
+    assert.strictEqual(result, 'PlainText');
+});
+
+test('decodeURIComponentWithCharset - empty string', () => {
+    const result = decodeURIComponentWithCharset('', 'utf-8');
+    assert.strictEqual(result, '');
+});
+
+test('decodeURIComponentWithCharset - case insensitive hex', () => {
+    const result = decodeURIComponentWithCharset('Test%2d%2D', 'utf-8');
+    assert.ok(result.includes('-'));
+});
+
+test('decodeURIComponentWithCharset - ISO-8859-1 charset', () => {
+    const result = decodeURIComponentWithCharset('Caf%E9', 'iso-8859-1');
+    assert.strictEqual(result, 'Café');
+});
+
+test('decodeURIComponentWithCharset - unicode character unencoded', () => {
+    const result = decodeURIComponentWithCharset('Test™', 'utf-8');
+    assert.ok(result.includes('Test'));
+    assert.ok(result.includes('™'));
+});
+
+test('decodeURIComponentWithCharset - plus sign not converted', () => {
+    // Unlike decodeURIComponent, plus should stay as plus
+    const result = decodeURIComponentWithCharset('Hello+World', 'utf-8');
+    assert.strictEqual(result, 'Hello+World');
+});
+
+test('decodeURIComponentWithCharset - all percent encoded', () => {
+    const result = decodeURIComponentWithCharset('%48%65%6C%6C%6F', 'utf-8');
+    assert.strictEqual(result, 'Hello');
+});
+
+test('decodeURIComponentWithCharset - invalid hex sequence ignored', () => {
+    const result = decodeURIComponentWithCharset('Test%ZZ', 'utf-8');
+    // Invalid sequence should be preserved
+    assert.ok(result.includes('%ZZ'));
+});
+
+test('decodeURIComponentWithCharset - incomplete hex sequence', () => {
+    const result = decodeURIComponentWithCharset('Test%2', 'utf-8');
+    // Incomplete sequence should be preserved
+    assert.ok(result.includes('%2'));
+});
+
+test('decodeURIComponentWithCharset - multiple consecutive percent signs', () => {
+    const result = decodeURIComponentWithCharset('Test%%20', 'utf-8');
+    assert.ok(result.includes('Test%'));
+});
+
+test('decodeURIComponentWithCharset - emoji encoded', () => {
+    const result = decodeURIComponentWithCharset('%F0%9F%98%80', 'utf-8');
+    assert.strictEqual(result, '😀');
+});
+
+test('decodeURIComponentWithCharset - Chinese characters', () => {
+    const result = decodeURIComponentWithCharset('%E4%BD%A0%E5%A5%BD', 'utf-8');
+    assert.strictEqual(result, '你好');
+});
+
+// Edge Cases
+test('decodeWord - Q-encoding with equals at end', () => {
+    const result = decodeWord('utf-8', 'Q', 'Test=');
+    assert.ok(result.includes('Test'));
+});
+
+test('decodeWords - nested encoded words', () => {
+    const result = decodeWords('=?utf-8?Q?=?inner?=?=');
+    // Should handle gracefully
+    assert.ok(result);
+});
+
+test('decodeWords - encoded word at start', () => {
+    const result = decodeWords('=?utf-8?Q?Start?= middle end');
+    assert.strictEqual(result, 'Start middle end');
+});
+
+test('decodeWords - encoded word at end', () => {
+    const result = decodeWords('start middle =?utf-8?Q?End?=');
+    assert.strictEqual(result, 'start middle End');
+});
+
+test('decodeWords - only whitespace', () => {
+    const result = decodeWords('   ');
+    assert.strictEqual(result, '   ');
+});
+
+test('decodeWord - B-encoding with invalid base64', () => {
+    // Invalid base64 should not crash
+    const result = decodeWord('utf-8', 'B', '!!!invalid!!!');
+    assert.ok(result);
+});
+
+test('decodeWords - underscore in Q-encoding converted to space', () => {
+    const result = decodeWords('=?utf-8?Q?Hello_World_Test?=');
+    assert.strictEqual(result, 'Hello World Test');
+});
+
+test('decodeWords - multiple charsets in sequence', () => {
+    const result = decodeWords('=?utf-8?Q?A?= =?iso-8859-1?Q?B?= =?utf-8?Q?C?=');
+    assert.ok(result.includes('A'));
+    assert.ok(result.includes('B'));
+    assert.ok(result.includes('C'));
+});
+
+// getDecoder function tests
+test('getDecoder - utf-8 charset', () => {
+    const decoder = getDecoder('utf-8');
+    assert.ok(decoder instanceof TextDecoder);
+    const result = decoder.decode(new Uint8Array([72, 101, 108, 108, 111]));
+    assert.strictEqual(result, 'Hello');
+});
+
+test('getDecoder - UTF-8 uppercase', () => {
+    const decoder = getDecoder('UTF-8');
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - iso-8859-1 charset', () => {
+    const decoder = getDecoder('iso-8859-1');
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - windows-1252 charset', () => {
+    const decoder = getDecoder('windows-1252');
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - unknown charset falls back to windows-1252', () => {
+    const decoder = getDecoder('unknown-fake-charset');
+    assert.ok(decoder instanceof TextDecoder);
+    // Should not throw and should be usable
+    const result = decoder.decode(new Uint8Array([84, 101, 115, 116]));
+    assert.strictEqual(result, 'Test');
+});
+
+test('getDecoder - iso-8859-8-i alias decodes as iso-8859-8', () => {
+    // "iso-8859-8-i" (logical order) is not a label strict WHATWG TextDecoders accept;
+    // it must be aliased to iso-8859-8 so Hebrew decodes instead of falling back to windows-1252.
+    const decoder = getDecoder('iso-8859-8-i');
+    // bytes for "שלום עולם" in iso-8859-8
+    const bytes = new Uint8Array([0xf9, 0xec, 0xe5, 0xed, 0x20, 0xf2, 0xe5, 0xec, 0xed]);
+    const result = decoder.decode(bytes);
+    assert.strictEqual(result, 'שלום עולם');
+    assert.ok(!result.includes('�'));
+});
+
+test('getDecoder - iso-8859-8-e alias decodes as iso-8859-8', () => {
+    // "iso-8859-8-e" is not a WHATWG label at all, so without the alias it would throw
+    // and fall back to windows-1252, producing mojibake in browsers/Workers.
+    const decoder = getDecoder('iso-8859-8-e');
+    const bytes = new Uint8Array([0xf9, 0xec, 0xe5, 0xed, 0x20, 0xf2, 0xe5, 0xec, 0xed]);
+    const result = decoder.decode(bytes);
+    assert.strictEqual(result, 'שלום עולם');
+    assert.ok(!result.includes('�'));
+});
+
+test('getDecoder - charset alias is case-insensitive', () => {
+    const decoder = getDecoder('ISO-8859-8-I');
+    const bytes = new Uint8Array([0xf9, 0xec, 0xe5, 0xed]);
+    const result = decoder.decode(bytes);
+    assert.strictEqual(result, 'שלום');
+});
+
+test('getDecoder - cp932 aliases decode as shift_jis', () => {
+    // "日本語" in Shift_JIS. cp932 is not a WHATWG label even though Japanese mail
+    // clients have written it for decades, so without the alias these fall back to
+    // windows-1252 and produce mojibake instead of failing.
+    const bytes = new Uint8Array([0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
+    for (const label of [
+        'cp932',
+        'windows-932',
+        'x-ms-cp932',
+        'x-cp932',
+        'ibm932',
+        'x-shift-jis',
+        'windows31j',
+        'ms-kanji'
+    ]) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '日本語', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - eucjp aliases decode as euc-jp', () => {
+    // "日本語" in EUC-JP
+    const bytes = new Uint8Array([0xc6, 0xfc, 0xcb, 0xdc, 0xb8, 0xec]);
+    for (const label of ['cp51932', 'eucjp', 'euc_jp', 'x-eucjp']) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '日本語', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - iso2022jp aliases decode as iso-2022-jp', () => {
+    // "日本語" in ISO-2022-JP, ie. ESC $ B ... ESC ( B
+    const bytes = new Uint8Array([0x1b, 0x24, 0x42, 0x46, 0x7c, 0x4b, 0x5c, 0x38, 0x6c, 0x1b, 0x28, 0x42]);
+    for (const label of [
+        'cp50220',
+        'cp50221',
+        'cp50222',
+        'iso2022jp',
+        'x-iso2022jp',
+        'x-iso-2022-jp',
+        'iso-2022-jp-1',
+        'iso-2022-jp-2',
+        'junet'
+    ]) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '日本語', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - cp936 aliases decode as gbk', () => {
+    // "中文" in GBK
+    const bytes = new Uint8Array([0xd6, 0xd0, 0xce, 0xc4]);
+    for (const label of ['cp936', 'windows-936', 'ms936', 'x-gb2312']) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '中文', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - cp950 aliases decode as big5', () => {
+    // "中文" in Big5
+    const bytes = new Uint8Array([0xa4, 0xa4, 0xa4, 0xe5]);
+    for (const label of ['cp950', 'windows-950', 'ms950', 'x-big5', 'x-windows-950']) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '中文', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - cp949 aliases decode as euc-kr', () => {
+    // "한국어" in EUC-KR
+    const bytes = new Uint8Array([0xc7, 0xd1, 0xb1, 0xb9, 0xbe, 0xee]);
+    for (const label of ['cp949', 'uhc', 'ms949', 'x-windows-949', 'ks_c_5601', 'euc_kr', 'x-euc-kr', 'ksc-5601']) {
+        assert.strictEqual(getDecoder(label).decode(bytes), '한국어', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - cp874 aliases decode as windows-874', () => {
+    // "สวัสดี" in windows-874
+    const bytes = new Uint8Array([0xca, 0xc7, 0xd1, 0xca, 0xb4, 0xd5]);
+    for (const label of ['cp874', 'ms874', 'tis620']) {
+        assert.strictEqual(getDecoder(label).decode(bytes), 'สวัสดี', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - labels the runtime accepts are used as written', () => {
+    // The alias table and normalization must only run once the label itself has been
+    // tried, so a runtime that knows iso-8859-8-i keeps its own decoder for it rather
+    // than the aliased iso-8859-8 one.
+    assert.strictEqual(getDecoder('iso-8859-8-i').encoding, 'iso-8859-8-i');
+
+    // Same for x- prefixed labels, whose stripped forms ("user-defined", "mac-cyrillic")
+    // are not labels on their own. Which of these a runtime knows varies by version, so
+    // only assert about the ones it has.
+    for (const label of ['x-user-defined', 'x-mac-cyrillic']) {
+        let native: string;
+        try {
+            native = new TextDecoder(label).encoding;
+        } catch {
+            continue;
+        }
+        assert.strictEqual(getDecoder(label).encoding, native, `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - code pages with no equivalent still fall back', () => {
+    // The code page allowlist must not match every cpNNN label. These have no index in
+    // the Encoding Standard, so windows-1252 stays the right answer for them.
+    for (const label of ['cp437', 'cp850', 'ibm852', 'cp1361']) {
+        assert.strictEqual(getDecoder(label).encoding, 'windows-1252', `unexpected result for ${label}`);
+    }
+});
+
+test('getDecoder - null charset defaults to utf-8', () => {
+    const decoder = getDecoder(null);
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - undefined charset defaults to utf-8', () => {
+    const decoder = getDecoder(undefined);
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - empty string charset defaults to utf-8', () => {
+    const decoder = getDecoder('');
+    assert.ok(decoder instanceof TextDecoder);
+});
+
+test('getDecoder - charset with language tag', () => {
+    // Some charsets might have language tags that need to be handled
+    const decoder = getDecoder('utf-8');
+    const bytes = new TextEncoder().encode('Cafe');
+    const result = decoder.decode(bytes);
+    assert.strictEqual(result, 'Cafe');
+});
+
+// blobToArrayBuffer function tests
+test('blobToArrayBuffer - simple text blob', async () => {
+    const blob = new Blob(['Hello World'], { type: 'text/plain' });
+    const buffer = await blobToArrayBuffer(blob);
+    assert.ok(buffer instanceof ArrayBuffer);
+    const text = new TextDecoder().decode(buffer);
+    assert.strictEqual(text, 'Hello World');
+});
+
+test('blobToArrayBuffer - empty blob', async () => {
+    const blob = new Blob([], { type: 'text/plain' });
+    const buffer = await blobToArrayBuffer(blob);
+    assert.ok(buffer instanceof ArrayBuffer);
+    assert.strictEqual(buffer.byteLength, 0);
+});
+
+test('blobToArrayBuffer - binary blob', async () => {
+    const bytes = new Uint8Array([0, 1, 2, 255, 254, 253]);
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const buffer = await blobToArrayBuffer(blob);
+    assert.ok(buffer instanceof ArrayBuffer);
+    const result = new Uint8Array(buffer);
+    assert.strictEqual(result.length, 6);
+    assert.strictEqual(result[0], 0);
+    assert.strictEqual(result[5], 253);
+});
+
+test('blobToArrayBuffer - large blob', async () => {
+    const largeText = 'A'.repeat(10000);
+    const blob = new Blob([largeText], { type: 'text/plain' });
+    const buffer = await blobToArrayBuffer(blob);
+    assert.ok(buffer instanceof ArrayBuffer);
+    assert.strictEqual(buffer.byteLength, 10000);
+});
+
+test('blobToArrayBuffer - blob with multiple parts', async () => {
+    const blob = new Blob(['Hello', ' ', 'World'], { type: 'text/plain' });
+    const buffer = await blobToArrayBuffer(blob);
+    const text = new TextDecoder().decode(buffer);
+    assert.strictEqual(text, 'Hello World');
+});
+
+// decodeBase64 function tests
+test('decodeBase64 - simple ASCII', () => {
+    const result = decodeBase64('SGVsbG8gV29ybGQ=');
+    const text = new TextDecoder().decode(result);
+    assert.strictEqual(text, 'Hello World');
+});
+
+test('decodeBase64 - no padding', () => {
+    const result = decodeBase64('SGVsbG8');
+    const text = new TextDecoder().decode(result);
+    assert.strictEqual(text, 'Hello');
+});
+
+test('decodeBase64 - single padding', () => {
+    const result = decodeBase64('SGVsbG8h');
+    const text = new TextDecoder().decode(result);
+    assert.strictEqual(text, 'Hello!');
+});
+
+test('decodeBase64 - double padding', () => {
+    const result = decodeBase64('SGk=');
+    const text = new TextDecoder().decode(result);
+    assert.strictEqual(text, 'Hi');
+});
+
+test('decodeBase64 - empty string', () => {
+    const result = decodeBase64('');
+    assert.strictEqual(result.byteLength, 0);
+});
+
+test('decodeBase64 - single character (2 base64 chars)', () => {
+    const result = decodeBase64('QQ==');
+    const text = new TextDecoder().decode(result);
+    assert.strictEqual(text, 'A');
+});
+
+// decodeParameterValueContinuations tests
+test('decodeParameterValueContinuations - simple continuation', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0': 'long',
+            'filename*1': 'file',
+            'filename*2': 'name.txt'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'longfilename.txt');
+});
+
+test('decodeParameterValueContinuations - encoded with charset', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0*': "utf-8''%C3%A4bc",
+            'filename*1*': '%C3%B6%C3%BC.txt'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    // The actual decoded characters: a-umlaut, o-umlaut, u-umlaut
+    assert.strictEqual(header.params.filename, 'äbcöü.txt');
+});
+
+test('decodeParameterValueContinuations - single encoded parameter', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*': "utf-8''test%20file.txt"
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'test file.txt');
+});
+
+test('decodeParameterValueContinuations - out of order continuations', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*2': 'c',
+            'filename*0': 'a',
+            'filename*1': 'b'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'abc');
+});
+
+test('decodeParameterValueContinuations - mixed regular and continuation params', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0': 'test',
+            'filename*1': '.txt',
+            size: '1234'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'test.txt');
+    assert.strictEqual(header.params.size, '1234');
+});
+
+test('decodeParameterValueContinuations - no continuation params', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            filename: 'test.txt',
+            size: '1234'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'test.txt');
+    assert.strictEqual(header.params.size, '1234');
+});
+
+test('decodeParameterValueContinuations - empty params', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {}
+    };
+    decodeParameterValueContinuations(header);
+    assert.deepStrictEqual(header.params, {});
+});
+
+test('decodeParameterValueContinuations - single value continuation', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0': 'onlypart.txt'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'onlypart.txt');
+});
+
+test('decodeParameterValueContinuations - iso-8859-1 charset', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*': "iso-8859-1''Caf%E9.txt"
+        }
+    };
+    decodeParameterValueContinuations(header);
+    // %E9 in iso-8859-1 is the e-acute character
+    assert.strictEqual(header.params.filename, 'Café.txt');
+});
+
+test('decodeParameterValueContinuations - language tag ignored', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*': "utf-8'en-US'test.txt"
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'test.txt');
+});
+
+// Coverage gap tests
+test('decodeWord - QP with incomplete hex at end', () => {
+    const result = decodeWord('utf-8', 'Q', 'Hello=C');
+    assert.ok(typeof result === 'string');
+    assert.ok(result.includes('Hello'));
+});
+
+test('decodeWords - three consecutive encoded words joined', () => {
+    const result = decodeWords('=?utf-8?B?SGVs?= =?utf-8?B?bG8g?= =?utf-8?B?V29ybGQ=?=');
+    assert.strictEqual(result, 'Hello World');
+});
+
+test('decodeParameterValueContinuations - gaps in sequence', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0': 'part1',
+            'filename*2': 'part3'
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.ok(header.params.filename.includes('part1'));
+    assert.ok(header.params.filename.includes('part3'));
+});
+
+test('decodeParameterValueContinuations - empty charset defaults to utf-8', () => {
+    const header: StructuredHeader = {
+        value: 'attachment',
+        params: {
+            'filename*0*': "''hello.txt"
+        }
+    };
+    decodeParameterValueContinuations(header);
+    assert.strictEqual(header.params.filename, 'hello.txt');
+});
+
+test('decodeWords - spaces between encoded words of different encodings removed', () => {
+    // Mixed B and Q encoding with same charset - spaces between should be removed
+    const result = decodeWords('=?utf-8?B?SGVsbG8=?= =?utf-8?Q?World?=');
+    assert.strictEqual(result, 'HelloWorld');
+});
+
+// Text decoding with and without a declared charset. Copied out of the Buffer pool so
+// that the ArrayBuffer holds the bytes and nothing else
+const latin1 = (str: string): ArrayBuffer => Uint8Array.from(Buffer.from(str, 'latin1')).buffer;
+
+test('decodeText - a declared charset is followed even when the bytes are not in it', () => {
+    assert.strictEqual(decodeText(latin1('caf\xe9'), 'utf-8', false), 'caf�');
+    assert.strictEqual(decodeText(latin1('caf\xe9'), 'iso-8859-1', false), 'café');
+});
+
+test('decodeText - without a charset, text that is not UTF-8 is read as windows-1252', () => {
+    assert.strictEqual(decodeText(latin1('caf\xc3\xa9'), undefined, false), 'café');
+    // legacy 8-bit mail, replacement characters would lose every accented letter in it.
+    // Compared with the runtime's own windows-1252 decoder, since Node 20 still decodes the
+    // C1 range of it as control characters rather than as the punctuation it stands for
+    const legacy = latin1('caf\xe9 \x93quoted\x94');
+    assert.strictEqual(decodeText(legacy, undefined, false), new TextDecoder('windows-1252').decode(legacy));
+    assert.ok(decodeText(legacy, undefined, false).startsWith('café '));
+});
+
+test('decodeText - an html part without a charset names its own', () => {
+    const httpEquiv =
+        '<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1251"></head><body>\xcf\xf0\xe8\xe2\xe5\xf2</body></html>';
+    assert.ok(decodeText(latin1(httpEquiv), undefined, true).includes('<body>Привет</body>'));
+    assert.ok(
+        decodeText(latin1('<meta charset=koi8-r><p>\xf0\xd2\xc9\xd7\xc5\xd4</p>'), undefined, true).includes(
+            '<p>Привет</p>'
+        )
+    );
+    // the transport charset wins over the document's own, as in a browser
+    assert.ok(decodeText(latin1('<meta charset=koi8-r><p>\xd0\x9f</p>'), 'utf-8', true).includes('<p>П</p>'));
+    // a plain text part is never sniffed
+    assert.strictEqual(decodeText(latin1('<meta charset=koi8-r> \xe9'), undefined, false), '<meta charset=koi8-r> é');
+});
+
+test('decodeText - an html part naming a charset nobody knows is read like one naming none', () => {
+    assert.strictEqual(
+        decodeText(latin1('<meta charset=garbage><p>caf\xc3\xa9</p>'), undefined, true),
+        '<meta charset=garbage><p>café</p>'
+    );
+});
+
+test('isUtf8 - tells well formed UTF-8 from anything else', () => {
+    const bytes = (str: string) => Buffer.from(str, 'latin1');
+    assert.strictEqual(isUtf8(bytes('plain ascii')), true);
+    assert.strictEqual(isUtf8(Buffer.from('café 日本 😀')), true);
+    assert.strictEqual(isUtf8(bytes('caf\xe9')), false);
+    // truncated, overlong, surrogate and out of range sequences
+    assert.strictEqual(isUtf8(bytes('\xc3')), false);
+    assert.strictEqual(isUtf8(bytes('\xc0\xaf')), false);
+    assert.strictEqual(isUtf8(bytes('\xe0\x80\xaf')), false);
+    assert.strictEqual(isUtf8(bytes('\xed\xa0\x80')), false);
+    assert.strictEqual(isUtf8(bytes('\xf4\x90\x80\x80')), false);
+    assert.strictEqual(isUtf8(bytes('\xf0\x9f\x98\x80')), true);
+});
+
+test('decodeCharset - an unknown charset label is read like a missing one', () => {
+    // unknown-8bit (RFC 1428) is what gateways stamp on legacy mail, and the bytes behind
+    // it are UTF-8 often enough that windows-1252 outright turned them into mojibake
+    assert.strictEqual(decodeCharset(Buffer.from('café'), 'unknown-8bit'), 'café');
+    assert.strictEqual(decodeCharset(Buffer.from('caf\xe9', 'latin1'), 'x-no-such-charset'), 'café');
+    assert.strictEqual(decodeWords('=?unknown-8bit?Q?caf=C3=A9?='), 'café');
+    assert.strictEqual(decodeWords('=?unknown-8bit?Q?caf=E9?='), 'café');
+});
+
+test('decodeText - a meta tag can not name UTF-16 or x-user-defined, like in the HTML prescan', () => {
+    // A tag the prescan could read as ASCII proves the document is not UTF-16. Decoding it
+    // as UTF-16 anyway turned NUL interleaved bytes a scanner sees as inert into markup
+    const utf16 = Buffer.concat([
+        Buffer.from('<!--', 'utf16le'),
+        Buffer.from('<meta charset=utf-16le> '),
+        Buffer.from('--><script>alert(1)</script>', 'utf16le')
+    ]);
+    const text = decodeText(Uint8Array.from(utf16).buffer, undefined, true);
+    assert.ok(text.includes('<meta charset=utf-16le>'));
+    assert.ok(!text.includes('<script>'));
+    assert.ok(!decodeText(latin1('<meta charset=unicode><p>x</p>'), undefined, true).includes('\u0000'));
+    // x-user-defined maps the high bytes to a private use area, windows-1252 is what is meant
+    assert.strictEqual(
+        decodeText(latin1('<meta charset=x-user-defined>caf\xe9'), undefined, true),
+        '<meta charset=x-user-defined>café'
+    );
+});
